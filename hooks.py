@@ -67,21 +67,26 @@ def _looks_like_secret(value: str) -> bool:
     val_lower = val_clean.lower()
 
 
-    # 1. Reject code syntax & expressions (e.g. array indexing samples[0], func(x), obj.prop)
-    if any(c in val_clean for c in "[](){}<>+=;,\\"):
+    # 1. Reject already masked / truncated values (e.g. 'sk-123...456', '***', '..')
+    if ".." in val_clean or "***" in val_clean or "<" in val_clean or ">" in val_clean:
         return False
 
-    # 2. Exact match ignored / placeholder words
-    if val_lower in PLACEHOLDER_KEYWORDS or val_clean.startswith("***"):
+    # 2. Reject code syntax & expressions (e.g. array indexing samples[0], func(x), obj.prop)
+    if any(c in val_clean for c in "[](){}+=;,\\"):
         return False
 
-    # 3. Starts with placeholder prefix (e.g. 'your-admin-key', 'example_token')
+    # 3. Exact match ignored / placeholder words
+    if val_lower in PLACEHOLDER_KEYWORDS:
+        return False
+
+    # 4. Starts with placeholder prefix (e.g. 'your-admin-key', 'example_token')
     if any(val_lower.startswith(p) for p in PLACEHOLDER_PREFIXES):
         return False
 
-    # 4. Trailing '_here', '-here', '_key', '-key' without digits
+    # 5. Trailing '_here', '-here', '_key', '-key' without digits
     if val_lower.endswith(("_here", "-here", "_key", "-key", "_token", "-token", "_secret", "-secret")) and not re.search(r"[0-9]", val_clean):
         return False
+
 
     # 5. Known real credential prefixes (override heuristics)
     if any(val_clean.startswith(p) for p in (

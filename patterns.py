@@ -7,8 +7,9 @@ PATTERNS = [
     r"custom_api_key_[0-9a-f]{40,}",
 
     # Standard Auth Headers
-    r"(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*",
-    r"(?i)authorization:\s*[A-Za-z0-9\-._~+/]+=*",
+    r"(?i)\bBearer\s+(?!None\b|null\b|undefined\b|your-)[A-Za-z0-9\-._~+/]{10,}=*",
+    r"(?i)authorization:\s*Bearer\s+(?!None\b|null\b|undefined\b|your-)[A-Za-z0-9\-._~+/]{10,}=*",
+
 
 
     # AI & Cloud Provider Keys
