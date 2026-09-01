@@ -1,0 +1,13 @@
+name: credential-safety
+kind: standalone
+version: 1.0.0
+author: masato
+description: |
+  Multi-layer credential leakage prevention plugin.
+  Redacts secrets from tool results, LLM output, and terminal logs.
+  
+capabilities:
+  - redaction-patterns
+  - tool-result-transform
+  - llm-output-transform
+  - terminal-output-transform
