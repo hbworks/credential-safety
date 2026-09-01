@@ -78,10 +78,26 @@ IGNORE_DIRS = {
 }
 
 # Authentic credential config files that are INTENDED to store secrets (should not be treated as leaks or broken by --fix)
-INTENDED_AUTH_FILES = {
+INTENDED_AUTH_FILE_NAMES = {
     "auth.json", "nous_auth.json", ".env", "credentials.json", "secrets.json",
+    "token.json", "tokens.json", "google_token.json", "google_credentials.json",
     "id_rsa", "id_ed25519", "key.pem", "cert.pem"
 }
+
+
+def is_intended_auth_file(file_path: Path) -> bool:
+    """Check if a file is an authentic credential storage file (e.g. auth.json, google_token.json, .env)."""
+    name_lower = file_path.name.lower()
+    if name_lower in INTENDED_AUTH_FILE_NAMES:
+        return True
+    if name_lower.startswith(".env") or name_lower.endswith(".env"):
+        return True
+    if name_lower.endswith(("_auth.json", "-auth.json", "_token.json", "-token.json", "_credentials.json", "-credentials.json", "_secret.json", "-secret.json")):
+        return True
+    if name_lower.startswith(("client_secret", "service_account", "gcp_credentials", "firebase_credentials")):
+        return True
+    return False
+
 
 
 PLACEHOLDER_PREFIXES = (
@@ -260,12 +276,13 @@ def collect_known_secrets(scan_roots: List[Path]) -> List[Tuple[str, str, str]]:
 
         candidate_files = []
         if root.is_file():
-            if root.name in INTENDED_AUTH_FILES or root.name.endswith((".env", "_auth.json", "-auth.json")):
+            if is_intended_auth_file(root):
                 candidate_files.append(root)
         elif root.is_dir():
             for f in root.rglob("*"):
-                if f.is_file() and (f.name in INTENDED_AUTH_FILES or f.name.endswith((".env", "_auth.json", "-auth.json"))):
+                if f.is_file() and is_intended_auth_file(f):
                     candidate_files.append(f)
+
 
         for cf in candidate_files:
             try:
@@ -608,8 +625,9 @@ def main():
                 continue
 
             # Skip legitimate auth configuration files during directory scanning
-            if target.is_dir() and (file_path.name in INTENDED_AUTH_FILES or file_path.name.endswith(("_auth.json", "-auth.json"))):
+            if target.is_dir() and is_intended_auth_file(file_path):
                 continue
+
 
             # Skip static repository/plugin documentation files (README.md, LICENSE, etc.) during directory scanning
             if target.is_dir() and file_path.name.lower() in ("readme.md", "license", "changelog.md", "contributing.md"):
