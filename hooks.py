@@ -75,16 +75,15 @@ def _looks_like_secret(value: str) -> bool:
     if val_lower in PLACEHOLDER_KEYWORDS or val_clean.startswith("***"):
         return False
 
-
-    # 2. Starts with placeholder prefix (e.g. 'your-admin-key', 'example_token')
+    # 3. Starts with placeholder prefix (e.g. 'your-admin-key', 'example_token')
     if any(val_lower.startswith(p) for p in PLACEHOLDER_PREFIXES):
         return False
 
-    # 3. Trailing '_here', '-here', '_key', '-key' without digits
+    # 4. Trailing '_here', '-here', '_key', '-key' without digits
     if val_lower.endswith(("_here", "-here", "_key", "-key", "_token", "-token", "_secret", "-secret")) and not re.search(r"[0-9]", val_clean):
         return False
 
-    # 4. Known real credential prefixes (override heuristics)
+    # 5. Known real credential prefixes (override heuristics)
     if any(val_clean.startswith(p) for p in (
         "AKIA", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-",
         "AIza", "ya29.", "hf_", "SG.", "xox", "xapp-", "sk_live_", "rk_live_", "sk_test_", "rk_test_"
@@ -92,7 +91,7 @@ def _looks_like_secret(value: str) -> bool:
         return True
 
     # Twilio SID / API Key (34 chars starting with AC / SK followed by hex)
-    if (val_clean.startswith("AC") or val_clean.startswith("SK")) and len(val_clean) == 34 and re.fullmatch(r"[A-Z0-9]+", val_clean):
+    if (val_clean.startswith("AC") or val_clean.startswith("SK")) and len(val_clean) == 34 and re.fullmatch(r"[A-Za-z0-9]+", val_clean):
         return True
 
     if val_clean.startswith("sk-"):
@@ -103,18 +102,16 @@ def _looks_like_secret(value: str) -> bool:
             return False
         return True
 
-
-
-
-    # 5. Hex strings (20+ hex characters, e.g. md5/sha or raw hex tokens)
+    # 6. Hex strings (20+ hex characters, e.g. md5/sha or raw hex tokens)
     if len(val_clean) >= 20 and re.fullmatch(r"[0-9a-fA-F]+", val_clean):
         return True
 
-    # 6. Character class analysis
+    # 7. Character class analysis
     has_lower = bool(re.search(r"[a-z]", val_clean))
     has_upper = bool(re.search(r"[A-Z]", val_clean))
     has_digit = bool(re.search(r"[0-9]", val_clean))
     has_special = bool(re.search(r"[^a-zA-Z0-9]", val_clean))
+
 
     # Reject if it contains ONLY letters and dashes/underscores with NO digits (kebab-case / snake_case placeholder)
     if (has_lower or has_upper) and not has_digit:
@@ -252,19 +249,19 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
 
     # 3. Natural language credential references (meta-discussion)
     for pattern in _NATURAL_LANGUAGE_PATTERNS:
-        for match in re.finditer(pattern, result):
-            if len(match.groups()) >= 2:
-                potential_secret = match.group(2)
+        def _nl_replacer(m):
+            if len(m.groups()) >= 2:
+                potential_secret = m.group(2)
                 if potential_secret != "***" and _looks_like_secret(potential_secret):
-                    result = result.replace(
-                        match.group(0),
-                        match.group(0).replace(potential_secret, "***"),
-                        1
-                    )
+                    return m.group(0).replace(potential_secret, "***", 1)
+            return m.group(0)
+
+        result = re.sub(pattern, _nl_replacer, result)
 
     if result != original:
         logger.debug("Redacted credential references from LLM output")
         return result
+
 
     return None
 

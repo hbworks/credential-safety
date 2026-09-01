@@ -15,34 +15,24 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Detection Patterns
+# Try importing patterns from package, current directory, or script directory
+try:
+    from . import patterns
+except (ImportError, ValueError):
+    try:
+        import patterns
+    except ImportError:
+        script_dir = str(Path(__file__).resolve().parent)
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        import patterns
+
+# Detection Patterns compiled from patterns.PATTERNS
 PATTERNS = [
-    # AI & Cloud Providers
-    ("OpenAI / Anthropic API Key", re.compile(r"\b(?:sk-(?:proj-|ant-|api03-|live-|test-)[A-Za-z0-9_\-]{20,}|sk-[A-Za-z0-9]{32,})\b")),
-    ("Google API Key", re.compile(r"\bAIza[0-9A-Za-z\-_]{30,40}\b")),
-    ("Google OAuth Token", re.compile(r"\bya29\.[0-9A-Za-z\-_]{20,}\b")),
-
-    ("HuggingFace Token", re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
-    ("AWS Access Key ID", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-
-    # Code Hosting & Version Control
-    ("GitHub Classic Token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{36,}\b")),
-    ("GitHub Fine-grained PAT", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{60,}\b")),
-    ("GitLab Token", re.compile(r"\bglpat-[A-Za-z0-9\-=_]{20,}\b")),
-
-
-    # SaaS & Communication APIs
-    ("Stripe Secret Key", re.compile(r"\b[sr]k_(?:live|test)_[0-9a-zA-Z]{24,}\b")),
-    ("SendGrid API Key", re.compile(r"\bSG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}\b")),
-    ("Twilio API Key / SID", re.compile(r"\b(?:SK|AC)[0-9a-fA-F]{32}\b")),
-    ("Slack User/Bot Token", re.compile(r"\bxox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9-]*\b")),
-    ("Slack App Token", re.compile(r"\bxapp-\d-[A-Za-z0-9]{8,}-\d+-[A-Za-z0-9]{8,}\b")),
-
-    # Cryptography & Auth Headers
-    ("JWT Token", re.compile(r"\beyJ[A-Za-z0-9-_=]{10,}\.[A-Za-z0-9-_=]{10,}\.?[A-Za-z0-9-_.+/=]*\b")),
-    ("Private Key", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----")),
-    ("Bearer Header", re.compile(r"\bBearer\s+[A-Za-z0-9\-._~+/]{20,}=*", re.IGNORECASE)),
+    ("Known Secret Pattern", re.compile(p if p.startswith(r"\b") or p.startswith("-----") or p.startswith("Bearer") or p.startswith("authorization") else rf"\b(?:{p})\b"))
+    for p in patterns.PATTERNS
 ]
+
 
 
 SECRET_KEY_REGEX = re.compile(
@@ -138,8 +128,9 @@ def looks_like_secret(value: str) -> bool:
         return True
 
     # Twilio SID / API Key (34 chars starting with AC / SK followed by hex)
-    if (val_clean.startswith("AC") or val_clean.startswith("SK")) and len(val_clean) == 34 and re.fullmatch(r"[A-Z0-9]+", val_clean):
+    if (val_clean.startswith("AC") or val_clean.startswith("SK")) and len(val_clean) == 34 and re.fullmatch(r"[A-Za-z0-9]+", val_clean):
         return True
+
 
     if val_clean.startswith("sk-"):
         # Reject machine learning libraries (sk-learn, sk-image, etc.) or pure word sequences without digits

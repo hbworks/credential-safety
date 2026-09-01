@@ -11,8 +11,9 @@ PATTERNS = [
     r"authorization:\s*[A-Za-z0-9\-._~+/]+=*",
 
     # AI & Cloud Provider Keys
-    r"sk-(?:proj-|ant-|api03-|live-|test-)[A-Za-z0-9_\-]{20,}|sk-[A-Za-z0-9]{32,}", # OpenAI / Anthropic / Stripe
+    r"sk-(?:proj-|ant-|api03-|live-|test-)[A-Za-z0-9_\-]{20,}|sk-[A-Za-z0-9]{32,}", # OpenAI / Anthropic
     r"AIza[0-9A-Za-z\-_]{30,40}",                                # Google API Key (Maps, YouTube, Firebase, Gemini)
+
     r"ya29\.[0-9A-Za-z\-_]{20,}",                                # Google OAuth2 Access Token
 
     r"hf_[A-Za-z0-9]{30,}",                                      # HuggingFace API Token
