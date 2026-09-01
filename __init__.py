@@ -1,8 +1,13 @@
 """Credential Safety Plugin - Multi-layer secret redaction."""
 import logging
-from . import patterns, hooks
+
+try:
+    from . import patterns, hooks
+except (ImportError, ValueError):
+    import patterns, hooks
 
 logger = logging.getLogger(__name__)
+
 
 
 def register(ctx):
