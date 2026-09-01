@@ -27,13 +27,31 @@ except (ImportError, ValueError):
             sys.path.insert(0, script_dir)
         import patterns
 
-NO_WORD_BOUNDARY = ("-----", "Bearer", "authorization", "(?i)Bearer", "(?i)authorization", "ya29.", "SG.", "xapp-", "xox")
-
 # Detection Patterns compiled from patterns.PATTERNS
+# (?i) などのインラインフラグを除いた実際の先頭文字列でホワイトリストを判定する
+# ※ 正規表現内の \. は実文字 . に相当するため、両方向でチェックする
+_NO_WORD_BOUNDARY_PREFIXES = (
+    r"\b", "-----", "Bearer", "bearer", "authorization",
+    "ya29.", "SG.", "xapp-", "xox", "(?:",
+)
+
+def _compile_pattern(p: str) -> re.Pattern:
+    """patterns.PATTERNS の各文字列を適切に compile する。
+    (?i) 等のインラインフラグや . を含む先頭パターンは \b を付与せず compile する。
+    """
+    # インラインフラグ (?i), (?m) 等を除去して実質的な先頭を取得
+    stripped = re.sub(r"^\(\?[imsx]+\)", "", p)
+    # 正規表現の \. → 実文字 . に変換（ホワイトリスト比較用）
+    stripped_plain = stripped.replace(r"\.", ".")
+    if any(stripped_plain.startswith(pfx) for pfx in _NO_WORD_BOUNDARY_PREFIXES):
+        return re.compile(p)
+    return re.compile(rf"\b(?:{p})\b")
+
 PATTERNS = [
-    ("Known Secret Pattern", re.compile(p if any(p.startswith(x) for x in NO_WORD_BOUNDARY) else rf"\b(?:{p})\b"))
+    ("Known Secret Pattern", _compile_pattern(p))
     for p in patterns.PATTERNS
 ]
+
 
 
 
