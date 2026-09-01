@@ -611,6 +611,12 @@ def main():
             if target.is_dir() and (file_path.name in INTENDED_AUTH_FILES or file_path.name.endswith(("_auth.json", "-auth.json"))):
                 continue
 
+            # Skip static repository/plugin documentation files (README.md, LICENSE, etc.) during directory scanning
+            if target.is_dir() and file_path.name.lower() in ("readme.md", "license", "changelog.md", "contributing.md"):
+                continue
+
+
+
             # Skip files larger than 10MB to avoid scanning huge binaries/dumps
             try:
                 if file_path.stat().st_size > 10 * 1024 * 1024:

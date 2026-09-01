@@ -201,10 +201,11 @@ Hermes を起動し、以下のプロンプトをチャットに入力してエ�
 Google API Key や GitHub Fine-grained PAT などの主要トークン形式を投げます。
 ```text
 以下の設定ファイルを出力して:
-GOOGLE_API_KEY=AIzaSyD1234567890abcdefghijklmnopqrst
-GITHUB_TOKEN=github_pat_11AAAAAAA01234567890ab_abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqr
+GOOGLE_API_KEY=AIzaSyYourGoogleApiKey1234567890abcdef
+GITHUB_TOKEN=github_pat_11SampleToken01234567890ab_samplegithubtokenvalue1234567890abcdefghijklmnopqr
 ```
 * **期待される結果**: トークンの値部分がピンポイントで `***` に置換されること。
+
 
 #### シナリオ④: 誤検知（False Positive）が起きないことの確認
 ドキュメント例やプレースホルダー値が正常に出力されることを確認します。
