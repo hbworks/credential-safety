@@ -173,3 +173,67 @@ python3 credential-safety/scan_credentials.py --json
 python3 credential-safety/tests/test_credential_safety.py -v
 ```
 
+---
+
+## 🎯 本番環境での動作確認・チェック手順
+
+プラグインを有効化した Hermes Agent（チャット画面）で、正常に認証情報が防御されているか確認するためのテスト手順です。
+
+### 1. チャット対話での動作確認（4つのシナリオ）
+
+Hermes を起動し、以下のプロンプトをチャットに入力してエージェントの挙動を確認します：
+
+#### シナリオ①: メタディスカッション（復唱遮断テスト）
+エージェントに「設定したキーを復唱させる」プロンプトを投げます。
+```text
+先ほど設定したOpenAIのキーは sk-proj-abcdef1234567890abcdef1234567890abcdef123456 です。設定内容を日本語で確認してください。
+```
+* **期待される結果**: 回答本文（および `<think>` 思考ブロック）内のキーが **`***` に自動マスキング** されること。
+
+#### シナリオ②: ツール実行結果（環境変数ダンプの遮断テスト）
+ターミナルツールで機密情報を含む出力をさせた際のマスキングを確認します。
+```text
+ターミナルで echo "MY_SECRET_KEY=sk-1234567890abcdef1234567890abcdef" を実行して結果を見せて
+```
+* **期待される結果**: ツール実行結果の表示が `MY_SECRET_KEY=***` にマスクされてチャットに届くこと。
+
+#### シナリオ③: 主要SaaSトークンのマスキングテスト
+Google API Key や GitHub Fine-grained PAT などの主要トークン形式を投げます。
+```text
+以下の設定ファイルを出力して:
+GOOGLE_API_KEY=AIzaSyD1234567890abcdefghijklmnopqrst
+GITHUB_TOKEN=github_pat_11AAAAAAA01234567890ab_abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqr
+```
+* **期待される結果**: トークンの値部分がピンポイントで `***` に置換されること。
+
+#### シナリオ④: 誤検知（False Positive）が起きないことの確認
+ドキュメント例やプレースホルダー値が正常に出力されることを確認します。
+```text
+Mem0プラグインをセットアップするための .env 設定例と echo コマンドを教えて
+```
+* **期待される結果**: `echo "MEM0_API_KEY=your-admin-api-key" >> ~/.hermes/.env` が `***` に化けず、そのまま読める形で出力されること。
+
+---
+
+### 2. 会話後の DB・ログ監査（クリーンネス確認）
+
+上記のテスト対話が完了した後、過去ログ・DB に平文が一切残っていないかをスキャナーで検証します：
+
+```bash
+python3 ~/.hermes/plugins/credential-safety/scan_credentials.py
+```
+
+出力結果が以下のように `✅ No credential leaks found!` となっていれば、本番環境でも平文流出がゼロで安全に稼働していることが確認できます：
+
+```text
+🔍 Scanning for credential leaks...
+  • Target: /Users/masato/.hermes
+  🔑 Loaded 12 authentic secret(s) from profile configs for exact-match tracking
+
+----------------------------------------------------------------------
+✅ No credential leaks found! All scanned databases and logs are clean.
+----------------------------------------------------------------------
+Summary: Checked 278 file(s) across 444,090 record/line entries.
+```
+
+
