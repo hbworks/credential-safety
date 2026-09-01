@@ -13,9 +13,11 @@ logger = logging.getLogger(__name__)
 def register(ctx):
     """Register credential safety plugin."""
     
-    # Layer 1: Pattern-based redaction
-    count = ctx.register_redaction_patterns(patterns.PATTERNS)
-    logger.info(f"Registered {count} custom redaction patterns")
+    # Layer 1: Pattern-based redaction (if supported by Hermes host)
+    if hasattr(ctx, "register_redaction_patterns"):
+        count = ctx.register_redaction_patterns(patterns.PATTERNS)
+        logger.info(f"Registered {count} custom redaction patterns")
+
     
     # Layer 2: Tool result transformation
     ctx.register_hook("transform_tool_result", hooks.redact_tool_result)
