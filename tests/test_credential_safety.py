@@ -80,14 +80,47 @@ class TestHooks(unittest.TestCase):
         self.assertIn("***", redacted)
         self.assertIn("USER=admin", redacted)  # Non-sensitive preserved
 
+    def test_placeholder_not_redacted(self):
+        """Placeholders and documentation commands should NOT be redacted."""
+        text = 'echo "MEM0_API_KEY=your-admin-api-key" >> ~/.hermes/.env'
+        redacted = hooks.redact_llm_output(text)
+        # Should remain intact
+        self.assertIsNone(redacted)
+
+        tool_res = 'API_KEY=your_api_key_here\nCONFIG=default'
+        redacted_tool = hooks.redact_tool_result("terminal", tool_res)
+        self.assertIsNone(redacted_tool)
+
+    def test_redact_new_patterns(self):
+        """Should redact Google, GitHub PAT, Stripe, and HuggingFace tokens."""
+        cases = [
+            ("Google API Key", "AIzaSyD-1234567890abcdefghijklmnopqrst", True),
+            ("Google OAuth", "ya29.a0AfH6SMD-1234567890abcdefghij", True),
+            ("GitHub PAT", "github_pat_11AAAAAAA01234567890ab_abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqr", True),
+            ("Stripe Secret", "sk_live_" + "a" * 24, True),
+            ("HuggingFace", "hf_abcdefghijklmnopqrstuvwxyz123456", True),
+        ]
+        for name, token, should_redact in cases:
+            text = f"API Token for {name}: {token}"
+            redacted = hooks.redact_llm_output(text)
+            self.assertIsNotNone(redacted, f"Failed to redact {name}")
+            self.assertNotIn(token, redacted, f"Token leaked in {name}")
+            self.assertIn("***", redacted)
+
     def test_looks_like_secret(self):
-        """Should identify likely secrets by entropy / structure."""
+        """Should identify likely secrets by entropy / structure and reject placeholders."""
         # High entropy or secret prefix = likely secret
         self.assertTrue(hooks._looks_like_secret("sk_abc123def456ghi789"))
         self.assertTrue(hooks._looks_like_secret("MyP@ssw0rd!"))
         self.assertTrue(hooks._looks_like_secret("AKIAIOSFODNN7EXAMPLE"))
+        self.assertTrue(hooks._looks_like_secret("AIzaSyD-1234567890abcdefghijklmnopqrst"))
+        self.assertTrue(hooks._looks_like_secret("github_pat_11AAAAAAA01234567890ab_abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqr"))
+        self.assertTrue(hooks._looks_like_secret("hf_abcdefghijklmnopqrstuvwxyz123456"))
 
-        # Low entropy / placeholders = not a secret
+        # Placeholders / common words = not a secret
+        self.assertFalse(hooks._looks_like_secret("your-admin-api-key"))
+        self.assertFalse(hooks._looks_like_secret("your_api_key_here"))
+        self.assertFalse(hooks._looks_like_secret("example-api-key"))
         self.assertFalse(hooks._looks_like_secret("admin"))
         self.assertFalse(hooks._looks_like_secret("user"))
         self.assertFalse(hooks._looks_like_secret("***"))

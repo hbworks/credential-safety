@@ -85,15 +85,25 @@ Hermes Agent における認証情報（APIキー、トークン、パスワー�
 
 ## 📦 対応している主なシークレット形式
 
-* **OpenAI / Anthropic / Stripe API Keys**: `sk-...`, `sk-ant-...`, `sk-proj-...`
-* **AWS Access Key ID**: `AKIA[0-9A-Z]{16}`
-* **GitHub Tokens**: `ghp_...`, `gho_...`, `ghu_...`, `ghs_...`, `ghr_...`
-* **GitLab Tokens**: `glpat-...`
-* **Slack Tokens**: `xoxb-...`, `xoxa-...`, `xoxp-...`
-* **JWT Tokens**: `eyJ...`
-* **Private Key Headers**: `-----BEGIN RSA/EC/OPENSSH PRIVATE KEY-----`
-* **Authorization Headers**: `Bearer ...`
+* **AI & Cloud Providers**:
+  * OpenAI / Anthropic: `sk-...`, `sk-ant-...`, `sk-proj-...`
+  * Google: `AIza...` (Gemini/Maps/Firebase), `ya29...` (OAuth Access Token)
+  * HuggingFace: `hf_...`
+  * AWS: `AKIA[0-9A-Z]{16}`
+* **Code Hosting & CI/CD**:
+  * GitHub: `ghp_...`, `gho_...`, `ghu_...`, `ghs_...`, `ghr_...`, `github_pat_...` (Fine-grained PAT)
+  * GitLab: `glpat-...`
+* **SaaS & Communication APIs**:
+  * Stripe: `sk_live_...`, `rk_live_...` (本番/制限キー)
+  * SendGrid: `SG....`
+  * Twilio: `SK...` (API Key SID), `AC...` (Account SID)
+  * Slack: `xoxb-...`, `xoxp-...` (User/Bot), `xapp-...` (App-level Token)
+* **Standard Cryptographic & Auth Headers**:
+  * JWT Tokens: `eyJ...` (多段セグメント構造)
+  * Private Key Headers: `-----BEGIN RSA/EC/OPENSSH PRIVATE KEY-----`
+  * Authorization Headers: `Bearer ...`
 * **汎用設定形式**: `API_KEY=...`, `PASSWORD=...`, `"token": "..."`
+
 
 ---
 
@@ -114,9 +124,52 @@ plugins:
 
 ---
 
+## 🔍 過去の会話DB・ログ監査ツール (`scan_credentials.py`)
+
+プラグイン環境とは独立して、**過去の会話DB（SQLite）やログファイル（JSON/JSONL/TXT）に平文の認証情報が残っていないかを一括スキャン・自動修復（サニタイズ）する単体CLIツール**が付属しています。
+
+外部依存ライブラリなし（Python 3 標準ライブラリのみ）で動作します。
+
+### 🌟 主な機能
+1. **各プロファイルの認証情報（`.env`, `auth.json`）の自動ロード＆完全一致追跡**:
+   * `~/.hermes/profiles/*/.env` や `auth.json` に設定されている実シークレットを自動収集し、**DBやログにその文字列がそのまま漏れていないかを偽陽性（誤検知）ゼロで最優先照合**します。
+2. **未知のシークレット・パスワードのヒューリスティクス検知**:
+   * 会話中にユーザーが直接教えたDBパスワードや動的発行トークンも、高精度シャノンエントロピー＋文字種分析で捕捉。
+3. **安全設計**:
+   * `auth.json` や `.env` などの正規設定ファイル自体はスキャン対象外として保護され、`--fix` 時にも誤って上書き破壊されることはありません。
+
+
+### 使い方
+
+#### 1. 監査スキャン（読み取りのみ）
+デフォルトで `~/.hermes/` およびカレントディレクトリ内のすべての DB/ログファイルを自動探索します：
+```bash
+python3 credential-safety/scan_credentials.py
+```
+
+特定の DB やディレクトリを指定する場合：
+```bash
+python3 credential-safety/scan_credentials.py ~/.hermes/history.sqlite ./logs/
+```
+
+#### 2. 自動マスキング・修復 (`--fix`)
+SQLite DB 内で検出されたシークレットを自動的に `***` で上書き修復します（※実行前に自動で `.bak` バックアップが作成されます）：
+```bash
+python3 credential-safety/scan_credentials.py ~/.hermes/history.sqlite --fix
+```
+
+#### 3. JSON 形式での出力
+CI/CD やスクリプト連携用に JSON で結果を出力できます：
+```bash
+python3 credential-safety/scan_credentials.py --json
+```
+
+---
+
 ## 🧪 テストの実行
 
 プラグイン単体でマスキング精度のユニットテストを実行できます：
 ```bash
 python3 credential-safety/tests/test_credential_safety.py -v
 ```
+
