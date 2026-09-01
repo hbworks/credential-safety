@@ -248,19 +248,20 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
     )
 
     # 3. Natural language credential references (meta-discussion)
-    for pattern in _NATURAL_LANGUAGE_PATTERNS:
-        def _nl_replacer(m):
-            if len(m.groups()) >= 2:
-                potential_secret = m.group(2)
-                if potential_secret != "***" and _looks_like_secret(potential_secret):
-                    return m.group(0).replace(potential_secret, "***", 1)
-            return m.group(0)
+    def _nl_replacer(m):
+        if len(m.groups()) >= 2:
+            potential_secret = m.group(2)
+            if potential_secret != "***" and _looks_like_secret(potential_secret):
+                return m.group(0).replace(potential_secret, "***", 1)
+        return m.group(0)
 
+    for pattern in _NATURAL_LANGUAGE_PATTERNS:
         result = re.sub(pattern, _nl_replacer, result)
 
     if result != original:
         logger.debug("Redacted credential references from LLM output")
         return result
+
 
 
     return None

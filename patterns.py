@@ -7,8 +7,9 @@ PATTERNS = [
     r"custom_api_key_[0-9a-f]{40,}",
 
     # Standard Auth Headers
-    r"Bearer\s+[A-Za-z0-9\-._~+/]+=*",
-    r"authorization:\s*[A-Za-z0-9\-._~+/]+=*",
+    r"(?i)Bearer\s+[A-Za-z0-9\-._~+/]+=*",
+    r"(?i)authorization:\s*[A-Za-z0-9\-._~+/]+=*",
+
 
     # AI & Cloud Provider Keys
     r"sk-(?:proj-|ant-|api03-|live-|test-)[A-Za-z0-9_\-]{20,}|sk-[A-Za-z0-9]{32,}", # OpenAI / Anthropic

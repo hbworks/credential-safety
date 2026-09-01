@@ -27,11 +27,14 @@ except (ImportError, ValueError):
             sys.path.insert(0, script_dir)
         import patterns
 
+NO_WORD_BOUNDARY = ("-----", "Bearer", "authorization", "(?i)Bearer", "(?i)authorization", "ya29.", "SG.", "xapp-", "xox")
+
 # Detection Patterns compiled from patterns.PATTERNS
 PATTERNS = [
-    ("Known Secret Pattern", re.compile(p if p.startswith(r"\b") or p.startswith("-----") or p.startswith("Bearer") or p.startswith("authorization") else rf"\b(?:{p})\b"))
+    ("Known Secret Pattern", re.compile(p if any(p.startswith(x) for x in NO_WORD_BOUNDARY) else rf"\b(?:{p})\b"))
     for p in patterns.PATTERNS
 ]
+
 
 
 
@@ -372,11 +375,12 @@ class LeakDetector:
         for secret_val, _, _ in self.known_secrets:
             result = result.replace(secret_val, "***")
 
-        # 2. Direct patterns
+        # 2. Direct patterns (callback defined outside loop)
+        def _replace_pattern(m):
+            val = m.group(0)
+            return "***" if looks_like_secret(val) else val
+
         for _, pattern in PATTERNS:
-            def _replace_pattern(m):
-                val = m.group(0)
-                return "***" if looks_like_secret(val) else val
             result = pattern.sub(_replace_pattern, result)
 
         # 3. Key-Value pairs
@@ -389,17 +393,19 @@ class LeakDetector:
 
         result = SECRET_KEY_REGEX.sub(_replace_kv, result)
 
-        # 4. Natural Language (safe re.sub callback)
+        # 4. Natural Language (callback defined outside loop)
+        def _replace_nl(m):
+            if len(m.groups()) >= 2:
+                val = m.group(2)
+                if val != "***" and looks_like_secret(val):
+                    return m.group(0).replace(val, "***", 1)
+            return m.group(0)
+
         for pat in NATURAL_LANG_REGEX:
-            def _replace_nl(m):
-                if len(m.groups()) >= 2:
-                    val = m.group(2)
-                    if val != "***" and looks_like_secret(val):
-                        return m.group(0).replace(val, "***", 1)
-                return m.group(0)
             result = pat.sub(_replace_nl, result)
 
         return result
+
 
 
 
