@@ -54,6 +54,32 @@ def _shannon_entropy(s: str) -> float:
     return -sum((count / len(s)) * math.log2(count / len(s)) for count in freq.values())
 
 
+def _is_placeholder(value: str) -> bool:
+    """Check if value is a documentation placeholder, dummy value, or already masked."""
+    if not value:
+        return True
+    val_clean = value.strip("\"'`<>[]{}")
+    val_lower = val_clean.lower()
+
+    # 1. Reject already masked / truncated values (e.g. 'sk-123...456', '***', '..')
+    if ".." in val_clean or "***" in val_clean or "<" in val_clean or ">" in val_clean:
+        return True
+
+    # 2. Exact match ignored / placeholder words
+    if val_lower in PLACEHOLDER_KEYWORDS:
+        return True
+
+    # 3. Starts with placeholder prefix (e.g. 'your-admin-key', 'example_token')
+    if any(val_lower.startswith(p) for p in PLACEHOLDER_PREFIXES):
+        return True
+
+    # 4. Trailing '_here', '-here', '_key', '-key' without digits
+    if val_lower.endswith(("_here", "-here", "_key", "-key", "_token", "-token", "_secret", "-secret")) and not re.search(r"[0-9]", val_clean):
+        return True
+
+    return False
+
+
 def _looks_like_secret(value: str) -> bool:
     """Accurate heuristic: detect genuine credentials and reject placeholders, code & words."""
     if not value or len(value) < 8:
@@ -66,29 +92,14 @@ def _looks_like_secret(value: str) -> bool:
     val_clean = value.strip("\"'`<>[]{}")
     val_lower = val_clean.lower()
 
-
-    # 1. Reject already masked / truncated values (e.g. 'sk-123...456', '***', '..')
-    if ".." in val_clean or "***" in val_clean or "<" in val_clean or ">" in val_clean:
+    if _is_placeholder(value):
         return False
 
-    # 2. Reject code syntax & expressions (e.g. array indexing samples[0], func(x), obj.prop)
+    # Reject code syntax & expressions (e.g. array indexing samples[0], func(x), obj.prop)
     if any(c in val_clean for c in "[](){}+=;,\\"):
         return False
 
-    # 3. Exact match ignored / placeholder words
-    if val_lower in PLACEHOLDER_KEYWORDS:
-        return False
-
-    # 4. Starts with placeholder prefix (e.g. 'your-admin-key', 'example_token')
-    if any(val_lower.startswith(p) for p in PLACEHOLDER_PREFIXES):
-        return False
-
-    # 5. Trailing '_here', '-here', '_key', '-key' without digits
-    if val_lower.endswith(("_here", "-here", "_key", "-key", "_token", "-token", "_secret", "-secret")) and not re.search(r"[0-9]", val_clean):
-        return False
-
-
-    # 5. Known real credential prefixes (override heuristics)
+    # Known real credential prefixes (override heuristics)
     if any(val_clean.startswith(p) for p in (
         "AKIA", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-",
         "AIza", "ya29.", "hf_", "SG.", "xox", "xapp-", "sk_live_", "rk_live_", "sk_test_", "rk_test_"
@@ -252,6 +263,21 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
         flags=re.IGNORECASE
     )
 
+    # Redact YAML/colon key-value fields in LLM output
+    def _replace_yaml_llm(m):
+        prefix = m.group(1)
+        val = m.group(2)
+        if _looks_like_secret(val):
+            return f"{prefix}***"
+        return m.group(0)
+
+    result = re.sub(
+        rf'(?m)^(\s*{_SECRET_KEY_REGEX}\s*:\s*)["\']?([^"\'\s\n]+)["\']?',
+        _replace_yaml_llm,
+        result,
+        flags=re.IGNORECASE
+    )
+
     # 3. Natural language credential references (meta-discussion)
     def _nl_replacer(m):
         if len(m.groups()) >= 2:
@@ -266,8 +292,6 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
     if result != original:
         logger.debug("Redacted credential references from LLM output")
         return result
-
-
 
     return None
 
@@ -290,19 +314,26 @@ def redact_terminal_output(command: str | None, output: str, **kwargs) -> str | 
     # 1. Direct patterns
     result = _apply_direct_patterns(result)
 
-    # 2. For env dumps and .env reads, redact KEY=value
+    # 2. For env dumps and .env reads, redact KEY=value (only genuine secrets to preserve placeholders)
     if command and any(x in command.lower() for x in ["env", "printenv", "export", ".env"]):
+        def _replace_env_secret(m):
+            key = m.group(1)
+            val = m.group(2)
+            if _looks_like_secret(val) or (not _is_placeholder(val) and len(val.strip("\"'")) >= 4):
+                return f"{key}=***"
+            return m.group(0)
+
         result = re.sub(
-            r"([A-Z_0-9]*(?:password|token|api[_-]?key|secret|auth)[A-Z_0-9]*)\s*=\s*([^\s\n]+)",
-            r"\1=***",
+            r"([A-Z_0-9]*(?:password|token|api[_-]?key|secret|auth)[A-Z_0-9]*)\s*=\s*([^\s\n\"']+)",
+            _replace_env_secret,
             result,
             flags=re.IGNORECASE
         )
 
-    # 3. General: KEY=value pattern anywhere
+    # 3. General: KEY=value pattern anywhere (only genuine secrets)
     result = re.sub(
-        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n]+)",
-        r"\1=***",
+        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\"']+)",
+        _replace_kv_if_secret,
         result,
         flags=re.IGNORECASE
     )

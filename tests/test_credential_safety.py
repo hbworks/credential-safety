@@ -126,6 +126,28 @@ class TestHooks(unittest.TestCase):
         self.assertFalse(hooks._looks_like_secret("***"))
         self.assertFalse(hooks._looks_like_secret("password"))
 
+    def test_redact_llm_output_yaml_colon_format(self):
+        """Should redact key: value format in YAML/code blocks from LLM output."""
+        yaml_text = "config:\n  password: MySuperSecurePassword999!\n  mode: production"
+        redacted = hooks.redact_llm_output(yaml_text)
+        self.assertIsNotNone(redacted)
+        self.assertNotIn("MySuperSecurePassword999!", redacted)
+        self.assertIn("password: ***", redacted)
+        self.assertIn("mode: production", redacted)
+
+    def test_redact_multiline_private_key(self):
+        """Should redact multiline private keys."""
+        priv_key = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEowIBAAKCAQEA0+abc123def456==\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        text = f"Here is the key:\n{priv_key}\nPlease keep it safe."
+        redacted = hooks.redact_llm_output(text)
+        self.assertIsNotNone(redacted)
+        self.assertNotIn("MIIEowIBAAKCAQEA0+abc123def456==", redacted)
+        self.assertIn("***", redacted)
+
 
 class TestScanner(unittest.TestCase):
     def test_collect_secrets_from_yaml(self):
@@ -143,7 +165,6 @@ backlog:
   subdomain: "myteam"
 """, encoding="utf-8")
 
-
             known = collect_known_secrets([tmp_path])
             self.assertEqual(len(known), 1)
             self.assertEqual(known[0][0], secret_key)
@@ -155,6 +176,50 @@ backlog:
             self.assertEqual(len(findings), 1)
             self.assertIn("Exact Match", findings[0]["type"])
 
+    def test_scan_file_multiline_private_key(self):
+        """Should detect multiline private keys in text/log files."""
+        import tempfile
+        from scan_credentials import LeakDetector, scan_json_or_text_file
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_file = Path(tmpdir) / "app.log"
+            content = (
+                "2026-09-03 INFO Starting service\n"
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                "MIIEowIBAAKCAQEA0+abc123def456==\n"
+                "-----END RSA PRIVATE KEY-----\n"
+                "2026-09-03 INFO Service stopped\n"
+            )
+            log_file.write_text(content, encoding="utf-8")
+
+            detector = LeakDetector()
+            recs, leaks = scan_json_or_text_file(log_file, detector)
+            self.assertEqual(leaks, 1)
+            self.assertEqual(len(detector.findings), 1)
+            self.assertEqual(detector.findings[0]["location"], "Line 2")
+
+    def test_scan_bearer_token_with_padding(self):
+        """Should detect and sanitize Bearer tokens ending with base64 padding '='."""
+        from scan_credentials import LeakDetector
+
+        detector = LeakDetector()
+        text = "Authorization: Bearer mySecretTokenValue123456="
+        findings = detector.scan_text(text, {"source_file": "api.log", "location": "Line 1"})
+        self.assertEqual(len(findings), 1)
+
+        sanitized = detector.sanitize_text(text)
+        self.assertNotIn("mySecretTokenValue123456=", sanitized)
+        self.assertIn("***", sanitized)
+
+    def test_all_patterns_acceptable_by_hermes_core(self):
+        """Verify that 100% of patterns are accepted by Hermes core register_redaction_patterns if present."""
+        try:
+            sys.path.insert(0, "/Users/masato/.hermes/hermes-agent")
+            from agent.redact import register_redaction_patterns
+            accepted = register_redaction_patterns(patterns.PATTERNS, source="test_suite")
+            self.assertEqual(accepted, len(patterns.PATTERNS))
+        except ImportError:
+            self.skipTest("Hermes agent source not found in standard location")
 
 
 if __name__ == "__main__":

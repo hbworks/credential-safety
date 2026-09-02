@@ -31,7 +31,7 @@ except (ImportError, ValueError):
 # (?i) などのインラインフラグを除いた実際の先頭文字列でホワイトリストを判定する
 # ※ 正規表現内の \. は実文字 . に相当するため、両方向でチェックする
 _NO_WORD_BOUNDARY_PREFIXES = (
-    r"\b", "-----", "Bearer", "bearer", "authorization",
+    r"\b", "-----", "Bearer", "bearer", "Authorization", "authorization",
     "ya29.", "SG.", "xapp-", "xox", "(?:",
 )
 
@@ -377,34 +377,54 @@ class LeakDetector:
         self.findings: List[Dict[str, Any]] = []
         self.known_secrets = known_secrets or []
 
-    def scan_text(self, text: str, source_info: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def scan_text(self, text: str, source_info: Dict[str, Any], with_line_numbers: bool = False) -> List[Dict[str, Any]]:
         """Scan string for leaks and return findings."""
         if not text or not isinstance(text, str):
             return []
 
         hits = []
+        matched_spans: List[Tuple[int, int]] = []
+
+        def _overlaps(start: int, end: int) -> bool:
+            return any(max(start, s) < min(end, e) for s, e in matched_spans)
+
+        def _make_source_info(pos: int) -> Dict[str, Any]:
+            info = dict(source_info)
+            if with_line_numbers:
+                line_num = text[:pos].count("\n") + 1
+                info["location"] = f"Line {line_num}"
+            return info
 
         # 1. Exact Match against known secrets from profile .env / auth.json (Zero False Positives!)
         for secret_val, secret_name, auth_src in self.known_secrets:
-            if secret_val in text:
-                hits.append({
-                    **source_info,
-                    "type": f"Exact Match ({secret_name})",
-                    "match": mask_secret(secret_val),
-                    "raw_length": len(secret_val),
-                    "raw_match": secret_val,
-                    "secret_source": auth_src,
-                })
+            start = 0
+            while True:
+                pos = text.find(secret_val, start)
+                if pos == -1:
+                    break
+                end = pos + len(secret_val)
+                if not _overlaps(pos, end):
+                    matched_spans.append((pos, end))
+                    hits.append({
+                        **_make_source_info(pos),
+                        "type": f"Exact Match ({secret_name})",
+                        "match": mask_secret(secret_val),
+                        "raw_length": len(secret_val),
+                        "raw_match": secret_val,
+                        "secret_source": auth_src,
+                    })
+                start = end
 
-        # 2. Regex direct signatures
+        # 2. Regex direct signatures (genuine tokens/keys - do not subject to generic code expression heuristics)
         for label, pattern in PATTERNS:
             for match in pattern.finditer(text):
                 val = match.group(0)
-                if val != "***" and looks_like_secret(val):
-                    # Avoid duplicate if already reported by exact match
-                    if not any(h.get("raw_match") == val for h in hits):
+                if val != "***" and not val.startswith("***"):
+                    start, end = match.span()
+                    if not _overlaps(start, end):
+                        matched_spans.append((start, end))
                         hits.append({
-                            **source_info,
+                            **_make_source_info(start),
                             "type": label,
                             "match": mask_secret(val),
                             "raw_length": len(val),
@@ -415,9 +435,11 @@ class LeakDetector:
         for match in SECRET_KEY_REGEX.finditer(text):
             val = match.group(2)
             if val != "***" and looks_like_secret(val):
-                if not any(h.get("raw_match") == val for h in hits):
+                start, end = match.span(2)
+                if not _overlaps(start, end):
+                    matched_spans.append((start, end))
                     hits.append({
-                        **source_info,
+                        **_make_source_info(match.start()),
                         "type": f"KeyValue ({match.group(1)})",
                         "match": mask_secret(val),
                         "raw_length": len(val),
@@ -430,9 +452,11 @@ class LeakDetector:
                 if len(match.groups()) >= 2:
                     val = match.group(2)
                     if val != "***" and looks_like_secret(val):
-                        if not any(h.get("raw_match") == val for h in hits):
+                        start, end = match.span(2)
+                        if not _overlaps(start, end):
+                            matched_spans.append((start, end))
                             hits.append({
-                                **source_info,
+                                **_make_source_info(match.start()),
                                 "type": f"NaturalLanguage ({match.group(1)})",
                                 "match": mask_secret(val),
                                 "raw_length": len(val),
@@ -452,17 +476,12 @@ class LeakDetector:
         for secret_val, _, _ in self.known_secrets:
             result = result.replace(secret_val, "***")
 
-        # 2. Direct patterns (callback defined outside loop)
-        def _replace_pattern(m):
-            val = m.group(0)
-            return "***" if looks_like_secret(val) else val
-
+        # 2. Direct patterns (scrub genuine token signatures)
         for _, pattern in PATTERNS:
-            result = pattern.sub(_replace_pattern, result)
+            result = pattern.sub("***", result)
 
         # 3. Key-Value pairs
         def _replace_kv(m):
-            key = m.group(1)
             val = m.group(2)
             if looks_like_secret(val):
                 return m.group(0).replace(val, "***", 1)
@@ -470,7 +489,7 @@ class LeakDetector:
 
         result = SECRET_KEY_REGEX.sub(_replace_kv, result)
 
-        # 4. Natural Language (callback defined outside loop)
+        # 4. Natural Language
         def _replace_nl(m):
             if len(m.groups()) >= 2:
                 val = m.group(2)
@@ -504,20 +523,26 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
         modified_rows = []
 
         for table in tables:
-            # Get table info (columns)
-            cursor.execute(f"PRAGMA table_info({table});")
+            # Get table info (columns) with quoted table name
+            cursor.execute(f'PRAGMA table_info("{table}");')
             cols_info = cursor.fetchall()
-            # Find primary key or rowid
-            pk_col = next((c[1] for c in cols_info if c[5] > 0), None)
 
             # Get text/blob columns
             col_names = [c[1] for c in cols_info]
             if not col_names:
                 continue
 
+            # Check if rowid is supported (most tables), otherwise fallback to primary key column
+            try:
+                cursor.execute(f'SELECT rowid FROM "{table}" LIMIT 1;')
+                cursor.fetchone()
+                pk_select = "rowid"
+            except Exception:
+                pk_col = next((c[1] for c in cols_info if c[5] > 0), col_names[0])
+                pk_select = f'"{pk_col}"'
+
             query_cols = ", ".join(f'"{c}"' for c in col_names)
-            pk_select = f'"{pk_col}"' if pk_col else "rowid"
-            cursor.execute(f"SELECT {pk_select}, {query_cols} FROM \"{table}\";")
+            cursor.execute(f'SELECT {pk_select}, {query_cols} FROM "{table}";')
 
             rows = cursor.fetchall()
             for row in rows:
@@ -569,23 +594,22 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
 
 
 def scan_json_or_text_file(file_path: Path, detector: LeakDetector) -> Tuple[int, int]:
-    """Scan plain text, JSON, or JSONL files for credential leaks."""
+    """Scan plain text, JSON, or JSONL files for credential leaks (including multiline secrets)."""
     records_checked = 0
     leaks_found = 0
 
     try:
         content = file_path.read_text(encoding="utf-8", errors="replace")
-        lines = content.splitlines()
+        records_checked = len(content.splitlines()) or (1 if content else 0)
 
-        for line_num, line in enumerate(lines, start=1):
-            records_checked += 1
-            hits = detector.scan_text(line, {
-                "source_file": str(file_path),
-                "location": f"Line {line_num}",
-            })
-            if hits:
-                detector.findings.extend(hits)
-                leaks_found += len(hits)
+        hits = detector.scan_text(
+            content,
+            {"source_file": str(file_path)},
+            with_line_numbers=True
+        )
+        if hits:
+            detector.findings.extend(hits)
+            leaks_found = len(hits)
     except Exception as e:
         print(f"  ⚠️ Error reading file {file_path}: {e}", file=sys.stderr)
 
