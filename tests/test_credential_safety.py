@@ -127,5 +127,35 @@ class TestHooks(unittest.TestCase):
         self.assertFalse(hooks._looks_like_secret("password"))
 
 
+class TestScanner(unittest.TestCase):
+    def test_collect_secrets_from_yaml(self):
+        """Should extract authentic API keys from config.yaml."""
+        import tempfile
+        from scan_credentials import collect_known_secrets, LeakDetector
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cfg_file = tmp_path / "config.yaml"
+            secret_key = "9knB7zK1pQ8vW2xM5tL0sR4uN6yP9aC3dE7fG1hJ5kL8mO2pQ6rS0tU4vW8xY2zA1"
+            cfg_file.write_text(f"""
+backlog:
+  BACKLOG_API_KEY: "{secret_key}"
+  subdomain: "myteam"
+""", encoding="utf-8")
+
+
+            known = collect_known_secrets([tmp_path])
+            self.assertEqual(len(known), 1)
+            self.assertEqual(known[0][0], secret_key)
+            self.assertIn("BACKLOG_API_KEY", known[0][1])
+
+            detector = LeakDetector(known_secrets=known)
+            log_text = f"Logged in with Backlog key: {secret_key}"
+            findings = detector.scan_text(log_text, {"file": "test.log", "location": "Line 1"})
+            self.assertEqual(len(findings), 1)
+            self.assertIn("Exact Match", findings[0]["type"])
+
+
+
 if __name__ == "__main__":
     unittest.main()

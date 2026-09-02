@@ -81,22 +81,31 @@ IGNORE_DIRS = {
 INTENDED_AUTH_FILE_NAMES = {
     "auth.json", "nous_auth.json", ".env", "credentials.json", "secrets.json",
     "token.json", "tokens.json", "google_token.json", "google_credentials.json",
-    "id_rsa", "id_ed25519", "key.pem", "cert.pem"
+    "config.yaml", "config.yml", "settings.yaml", "settings.yml", "secrets.yaml", "secrets.yml",
+    "hermes.yaml", "hermes.yml", "id_rsa", "id_ed25519", "key.pem", "cert.pem"
 }
 
 
 def is_intended_auth_file(file_path: Path) -> bool:
-    """Check if a file is an authentic credential storage file (e.g. auth.json, google_token.json, .env)."""
+    """Check if a file is an authentic credential storage file (e.g. auth.json, config.yaml, .env)."""
     name_lower = file_path.name.lower()
     if name_lower in INTENDED_AUTH_FILE_NAMES:
         return True
     if name_lower.startswith(".env") or name_lower.endswith(".env"):
         return True
-    if name_lower.endswith(("_auth.json", "-auth.json", "_token.json", "-token.json", "_credentials.json", "-credentials.json", "_secret.json", "-secret.json")):
+    if name_lower.endswith((
+        "_auth.json", "-auth.json", "_token.json", "-token.json",
+        "_credentials.json", "-credentials.json", "_secret.json", "-secret.json",
+        "_auth.yaml", "-auth.yaml", "_token.yaml", "-token.yaml",
+        "_config.yaml", "-config.yaml", "_secret.yaml", "-secret.yaml",
+        "_auth.yml", "-auth.yml", "_token.yml", "-token.yml",
+        "_config.yml", "-config.yml", "_secret.yml", "-secret.yml"
+    )):
         return True
     if name_lower.startswith(("client_secret", "service_account", "gcp_credentials", "firebase_credentials")):
         return True
     return False
+
 
 
 
@@ -286,26 +295,53 @@ def collect_known_secrets(scan_roots: List[Path]) -> List[Tuple[str, str, str]]:
 
         for cf in candidate_files:
             try:
+                def _extract_from_dict(d, prefix=""):
+                    if isinstance(d, dict):
+                        for k, v in d.items():
+                            path_k = f"{prefix}.{k}" if prefix else str(k)
+                            if isinstance(v, str):
+                                v_clean = v.strip()
+                                if _is_valid_extracted_secret(path_k, v_clean) and v_clean not in seen_values:
+                                    seen_values.add(v_clean)
+                                    collected.append((v_clean, path_k, str(cf)))
+                            elif isinstance(v, (dict, list)):
+                                _extract_from_dict(v, path_k)
+                    elif isinstance(d, list):
+                        for idx, item in enumerate(d):
+                            _extract_from_dict(item, f"{prefix}[{idx}]")
+
                 # 1. Parse JSON auth files
                 if cf.suffix.lower() == ".json":
                     data = json.loads(cf.read_text(encoding="utf-8", errors="replace"))
-                    def _extract_from_dict(d, prefix=""):
-                        if isinstance(d, dict):
-                            for k, v in d.items():
-                                path_k = f"{prefix}.{k}" if prefix else k
-                                if isinstance(v, str):
-                                    v_clean = v.strip()
-                                    if _is_valid_extracted_secret(path_k, v_clean) and v_clean not in seen_values:
-                                        seen_values.add(v_clean)
-                                        collected.append((v_clean, path_k, str(cf)))
-                                elif isinstance(v, (dict, list)):
-                                    _extract_from_dict(v, path_k)
-                        elif isinstance(d, list):
-                            for idx, item in enumerate(d):
-                                _extract_from_dict(item, f"{prefix}[{idx}]")
                     _extract_from_dict(data)
 
-                # 2. Parse .env files
+                # 2. Parse YAML auth / config files
+                elif cf.suffix.lower() in (".yaml", ".yml"):
+                    content = cf.read_text(encoding="utf-8", errors="replace")
+                    parsed_yaml = None
+                    try:
+                        import yaml
+                        parsed_yaml = yaml.safe_load(content)
+                    except Exception:
+                        pass
+
+                    if isinstance(parsed_yaml, (dict, list)):
+                        _extract_from_dict(parsed_yaml)
+                    else:
+                        # Fallback line-based regex parser for YAML (no pyyaml dependency required)
+                        for line in content.splitlines():
+                            line = line.strip()
+                            if not line or line.startswith("#"):
+                                continue
+                            m = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*[\"']?([^\"'#\n]+)[\"']?", line)
+                            if m:
+                                k = m.group(1).strip()
+                                v = m.group(2).strip()
+                                if _is_valid_extracted_secret(k, v) and v not in seen_values:
+                                    seen_values.add(v)
+                                    collected.append((v, k, str(cf)))
+
+                # 3. Parse .env files
                 elif cf.suffix.lower() in (".env", "") or cf.name.startswith(".env"):
                     content = cf.read_text(encoding="utf-8", errors="replace")
                     for line in content.splitlines():
@@ -323,6 +359,7 @@ def collect_known_secrets(scan_roots: List[Path]) -> List[Tuple[str, str, str]]:
                                 collected.append((v, k, str(cf)))
             except Exception:
                 pass
+
 
     return collected
 
