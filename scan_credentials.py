@@ -12,6 +12,7 @@ import re
 import shutil
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -116,6 +117,8 @@ def is_intended_auth_file(file_path: Path) -> bool:
 looks_like_secret = hooks._looks_like_secret
 _shannon_entropy = hooks._shannon_entropy
 _is_placeholder = hooks._is_placeholder
+_should_mask_value = getattr(hooks, "_should_mask_value", lambda k, v: looks_like_secret(v))
+_is_sensitive_key = getattr(hooks, "_is_sensitive_key", lambda k: False)
 PLACEHOLDER_PREFIXES = hooks.PLACEHOLDER_PREFIXES
 PLACEHOLDER_KEYWORDS = hooks.PLACEHOLDER_KEYWORDS
 
@@ -167,15 +170,23 @@ def _is_valid_extracted_secret(key_name: str, value: str) -> bool:
 
 
 def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
-    """Lightweight pure-Python fallback YAML parser supporting nested mappings.
+    """Lightweight pure-Python fallback YAML parser supporting nested mappings with syntax validation.
 
     Parses indentation-based nested YAML without requiring the external PyYAML package.
     Supports comments, quoted strings, nested dictionaries, and list items.
+    Validates indentation hierarchy, bracket matching, quotes, and forbidden tabs.
     """
     root: Dict[str, Any] = {}
-    stack: List[Tuple[int, Any]] = [(-1, root)]
+    stack: List[Tuple[int, Any, Optional[str]]] = [(-1, root, None)]
+    expecting_indent_after: Optional[Tuple[int, str, int]] = None
 
-    for raw_line in content.splitlines():
+    for line_num, raw_line in enumerate(content.splitlines(), start=1):
+        # 1. Reject tab characters in indentation
+        leading_spaces = len(raw_line) - len(raw_line.lstrip(" "))
+        if "\t" in raw_line[:leading_spaces + 1]:
+            raise ValueError(f"Line {line_num}: Tab characters are forbidden in YAML indentation")
+
+        # Strip comments outside quotes
         line_no_comment = raw_line
         if "#" in raw_line:
             in_quote = False
@@ -200,6 +211,41 @@ def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
 
         indent = len(raw_line) - len(raw_line.lstrip(" "))
 
+        # 2. Check if this line satisfies required indent from preceding mapping key without value
+        if expecting_indent_after is not None:
+            parent_indent, parent_key, parent_line = expecting_indent_after
+            if indent <= parent_indent:
+                raise ValueError(
+                    f"Line {line_num}: Bad indentation after mapping key (line {parent_line}); "
+                    f"expected indent > {parent_indent}, found {indent}"
+                )
+            expecting_indent_after = None
+
+        # 3. Check for unclosed brackets or braces in line (only outside quotes)
+        in_q = False
+        q_c = ""
+        open_b = 0
+        open_c = 0
+        for ch in stripped:
+            if ch in ('"', "'"):
+                if not in_q:
+                    in_q = True
+                    q_c = ch
+                elif q_c == ch:
+                    in_q = False
+            elif not in_q:
+                if ch == "[":
+                    open_b += 1
+                elif ch == "]":
+                    open_b -= 1
+                elif ch == "{":
+                    open_c += 1
+                elif ch == "}":
+                    open_c -= 1
+
+        if open_b != 0 or open_c != 0:
+            raise ValueError(f"Line {line_num}: Unclosed brackets or braces in YAML")
+
         while len(stack) > 1 and stack[-1][0] >= indent:
             stack.pop()
 
@@ -219,12 +265,15 @@ def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
                     elif quote_char == ch:
                         in_quote = False
                 elif ch == ":" and not in_quote:
-                    colon_pos = idx
-                    break
+                    if idx + 1 == len(item_text) or item_text[idx + 1] in (" ", "\t"):
+                        colon_pos = idx
+                        break
 
             if colon_pos != -1:
                 k = item_text[:colon_pos].strip().strip("\"'")
                 v = item_text[colon_pos + 1:].strip()
+                if (v.startswith('"') and not v.endswith('"')) or (v.startswith("'") and not v.endswith("'")) or (len(v) == 1 and v in ('"', "'")):
+                    raise ValueError(f"Line {line_num}: Unclosed quotes in YAML list value")
                 if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
                     v = v[1:-1]
                 item_dict = {k: v} if v else {}
@@ -233,7 +282,8 @@ def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
                 elif isinstance(current_container, dict):
                     current_container.setdefault("_items", []).append(item_dict)
                 if not v:
-                    stack.append((indent, item_dict))
+                    stack.append((indent, item_dict, k))
+                    expecting_indent_after = (indent, k, line_num)
             else:
                 val = item_text.strip("\"'")
                 if isinstance(current_container, list):
@@ -254,8 +304,9 @@ def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
                 elif quote_char == ch:
                     in_quote = False
             elif ch == ":" and not in_quote:
-                colon_pos = idx
-                break
+                if idx + 1 == len(stripped) or stripped[idx + 1] in (" ", "\t"):
+                    colon_pos = idx
+                    break
 
         if colon_pos != -1:
             key = stripped[:colon_pos].strip().strip("\"'")
@@ -267,8 +318,11 @@ def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
                     current_container[key] = new_dict
                 elif isinstance(current_container, list):
                     current_container.append({key: new_dict})
-                stack.append((indent, new_dict))
+                stack.append((indent, new_dict, key))
+                expecting_indent_after = (indent, key, line_num)
             else:
+                if (val_part.startswith('"') and not val_part.endswith('"')) or (val_part.startswith("'") and not val_part.endswith("'")) or (len(val_part) == 1 and val_part in ('"', "'")):
+                    raise ValueError(f"Line {line_num}: Unclosed quotes in YAML value")
                 if (val_part.startswith('"') and val_part.endswith('"')) or (val_part.startswith("'") and val_part.endswith("'")):
                     val = val_part[1:-1]
                 else:
@@ -277,11 +331,13 @@ def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
                     current_container[key] = val
                 elif isinstance(current_container, list):
                     current_container.append({key: val})
+        else:
+            raise ValueError(f"Line {line_num}: Invalid YAML syntax (missing colon or unrecognized item)")
 
     return root
 
 
-def collect_known_secrets(scan_roots: List[Path]) -> List[Tuple[str, str, str]]:
+def collect_known_secrets(scan_roots: List[Path], errors: Optional[List[str]] = None) -> List[Tuple[str, str, str]]:
     """Automatically collect real secret values from all profile .env and auth.json files.
 
     Returns: List of (secret_value, key_name, source_file_path)
@@ -328,70 +384,118 @@ def collect_known_secrets(scan_roots: List[Path]) -> List[Tuple[str, str, str]]:
                 # 2. Parse YAML auth / config files
                 elif cf.suffix.lower() in (".yaml", ".yml"):
                     content = cf.read_text(encoding="utf-8", errors="replace")
-                    parsed_yaml = None
+                    has_pyyaml = False
                     try:
                         import yaml
+                        has_pyyaml = (yaml is not None)
+                    except ImportError:
+                        has_pyyaml = False
+
+                    if has_pyyaml:
+                        # Strictly validate YAML syntax with PyYAML
                         parsed_yaml = yaml.safe_load(content)
-                    except Exception:
-                        pass
-
-                    if not isinstance(parsed_yaml, (dict, list)):
-                        try:
-                            parsed_yaml = _parse_yaml_fallback(content)
-                        except Exception:
-                            parsed_yaml = None
-
-                    if isinstance(parsed_yaml, (dict, list)) and parsed_yaml:
-                        _extract_from_dict(parsed_yaml)
+                        if isinstance(parsed_yaml, (dict, list)) and parsed_yaml:
+                            _extract_from_dict(parsed_yaml)
                     else:
-                        # Fallback line-based regex parser for YAML (no pyyaml dependency required)
-                        for line in content.splitlines():
-                            line = line.strip()
-                            if not line or line.startswith("#"):
-                                continue
-                            m = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*[\"']?([^\"'#\n]+)[\"']?", line)
-                            if m:
-                                k = m.group(1).strip()
-                                v = m.group(2).strip()
-                                if _is_valid_extracted_secret(k, v) and v not in seen_values:
-                                    seen_values.add(v)
-                                    collected.append((v, k, str(cf)))
+                        # Fallback for environments without PyYAML: strictly validate with pure-Python parser
+                        parsed_yaml = _parse_yaml_fallback(content)
+                        if isinstance(parsed_yaml, (dict, list)) and parsed_yaml:
+                            _extract_from_dict(parsed_yaml)
 
                 # 3. Parse .env files
                 elif cf.suffix.lower() in (".env", "") or cf.name.startswith(".env"):
                     content = cf.read_text(encoding="utf-8", errors="replace")
-                    for line in content.splitlines():
-                        line = line.strip()
+                    invalid_lines = []
+                    for line_num, raw_line in enumerate(content.splitlines(), start=1):
+                        line = raw_line.strip()
                         if not line or line.startswith("#"):
                             continue
                         if line.startswith("export "):
                             line = line[7:].strip()
-                        if "=" in line:
-                            k, v = line.split("=", 1)
-                            k = k.strip()
-                            v = v.strip().strip("\"'")
-                            if _is_valid_extracted_secret(k, v) and v not in seen_values:
-                                seen_values.add(v)
-                                collected.append((v, k, str(cf)))
-            except Exception:
-                pass
+
+                        # 1. Missing '='
+                        if "=" not in line:
+                            invalid_lines.append(f"Line {line_num}: missing '='")
+                            continue
+
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip()
+
+                        # 2. Empty key
+                        if not k:
+                            invalid_lines.append(f"Line {line_num}: empty key name")
+                            continue
+
+                        # 3. Invalid characters in key name
+                        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", k):
+                            invalid_lines.append(f"Line {line_num}: invalid key name")
+                            continue
+
+                        # 4. Unclosed quotes in value
+                        if (v.startswith('"') and not v.endswith('"')) or (v.startswith("'") and not v.endswith("'")) or (len(v) == 1 and v in ('"', "'")):
+                            invalid_lines.append(f"Line {line_num}: unclosed quote in value")
+                            continue
+
+                        # 5. Broken continuation line
+                        if v.endswith("\\"):
+                            invalid_lines.append(f"Line {line_num}: broken continuation line")
+                            continue
+
+                        v_clean = v.strip("\"'")
+                        if _is_valid_extracted_secret(k, v_clean) and v_clean not in seen_values:
+                            seen_values.add(v_clean)
+                            collected.append((v_clean, k, str(cf)))
+
+                    if invalid_lines:
+                        raise ValueError(f"Malformed .env file: {'; '.join(invalid_lines[:3])}")
+            except Exception as e:
+                clean_err = _clean_parse_error(e)
+                err_msg = f"Failed to parse authentic config file {cf}: {clean_err}"
+                if errors is not None:
+                    errors.append(err_msg)
+                print(f"  ⚠️ {err_msg}", file=sys.stderr)
 
 
     return collected
 
 
+def _clean_parse_error(e: Exception) -> str:
+    """Format parser errors safely without echoing raw file snippets or leaked secrets."""
+    # PyYAML errors (MarkedYAMLError) include source snippets in str(e).
+    # Safely extract line, column, and error description without echoing line content.
+    if hasattr(e, "problem"):
+        mark = getattr(e, "problem_mark", None)
+        context = getattr(e, "context", None)
+        problem = getattr(e, "problem", "syntax error")
+        loc = f"line {mark.line + 1}, column {mark.column + 1}" if mark else "unknown location"
+        ctx_desc = f" ({context})" if context else ""
+        return f"YAML error near {loc}: {problem}{ctx_desc}"
+
+    # General exceptions: keep only the first line to avoid multiline code dumps
+    msg = str(e)
+    return msg.splitlines()[0] if msg else "Unknown error"
+
+
 
 def mask_secret(secret_str: str) -> str:
-    """Mask secret keeping first 3 and last 3 chars."""
-    if len(secret_str) <= 8:
-        return "***"
-    return f"{secret_str[:3]}...{secret_str[-3:]}"
+    """Mask secret completely as ***.
+
+    Ensures absolute zero secret leakage: no partial prefix or suffix fragments
+    are ever emitted into audit findings or CLI output.
+    """
+    return "***"
 
 
 class LeakDetector:
     def __init__(self, known_secrets: Optional[List[Tuple[str, str, str]]] = None):
         self.findings: List[Dict[str, Any]] = []
+        self.errors: List[str] = []
         self.known_secrets = known_secrets or []
+
+    def record_error(self, err_msg: str) -> None:
+        """Record an error encountered during scanning."""
+        self.errors.append(err_msg)
 
     def scan_text(self, text: str, source_info: Dict[str, Any], with_line_numbers: bool = False) -> List[Dict[str, Any]]:
         """Scan string for leaks and return findings."""
@@ -426,7 +530,6 @@ class LeakDetector:
                         "type": f"Exact Match ({secret_name})",
                         "match": mask_secret(secret_val),
                         "raw_length": len(secret_val),
-                        "raw_match": secret_val,
                         "secret_source": auth_src,
                     })
                 start = end
@@ -444,39 +547,38 @@ class LeakDetector:
                             "type": label,
                             "match": mask_secret(val),
                             "raw_length": len(val),
-                            "raw_match": val,
                         })
 
         # 3. Key-Value pairs
         for match in SECRET_KEY_REGEX.finditer(text):
+            key_name = match.group(1)
             val = match.group(2)
-            if val != "***" and looks_like_secret(val):
+            if val != "***" and _should_mask_value(key_name, val):
                 start, end = match.span(2)
                 if not _overlaps(start, end):
                     matched_spans.append((start, end))
                     hits.append({
                         **_make_source_info(match.start()),
-                        "type": f"KeyValue ({match.group(1)})",
+                        "type": f"KeyValue ({key_name})",
                         "match": mask_secret(val),
                         "raw_length": len(val),
-                        "raw_match": val,
                     })
 
         # 4. Natural Language
         for pat in NATURAL_LANG_REGEX:
             for match in pat.finditer(text):
                 if len(match.groups()) >= 2:
+                    key_name = match.group(1)
                     val = match.group(2)
-                    if val != "***" and looks_like_secret(val):
+                    if val != "***" and _should_mask_value(key_name, val):
                         start, end = match.span(2)
                         if not _overlaps(start, end):
                             matched_spans.append((start, end))
                             hits.append({
                                 **_make_source_info(match.start()),
-                                "type": f"NaturalLanguage ({match.group(1)})",
+                                "type": f"NaturalLanguage ({key_name})",
                                 "match": mask_secret(val),
                                 "raw_length": len(val),
-                                "raw_match": val,
                             })
 
         return hits
@@ -498,8 +600,9 @@ class LeakDetector:
 
         # 3. Key-Value pairs
         def _replace_kv(m):
+            key_name = m.group(1)
             val = m.group(2)
-            if looks_like_secret(val):
+            if _should_mask_value(key_name, val):
                 return m.group(0).replace(val, "***", 1)
             return m.group(0)
 
@@ -508,8 +611,9 @@ class LeakDetector:
         # 4. Natural Language
         def _replace_nl(m):
             if len(m.groups()) >= 2:
+                key_name = m.group(1)
                 val = m.group(2)
-                if val != "***" and looks_like_secret(val):
+                if _should_mask_value(key_name, val):
                     return m.group(0).replace(val, "***", 1)
             return m.group(0)
 
@@ -524,9 +628,60 @@ def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _atomic_create_backup(src_path: Path) -> Path:
+    """Atomically create a unique backup copy of src_path without TOCTOU race conditions.
+
+    Uses OS-level atomic creation (O_CREAT | O_EXCL) so that multiple concurrent processes
+    cannot collide or overwrite each other's backups.
+    """
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+
+    def _try_atomic_copy(dest: Path) -> bool:
+        try:
+            fd = os.open(str(dest), flags, 0o600)
+        except FileExistsError:
+            return False
+
+        try:
+            with open(fd, "wb", closefd=True) as f_out, open(src_path, "rb") as f_in:
+                shutil.copyfileobj(f_in, f_out)
+            shutil.copystat(src_path, dest)
+            return True
+        except Exception:
+            try:
+                dest.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+
+    # 1. Try standard backup (e.g. data.sqlite.bak)
+    primary_bak = src_path.with_suffix(f"{src_path.suffix}.bak")
+    if _try_atomic_copy(primary_bak):
+        return primary_bak
+
+    # 2. Try timestamped backup (e.g. data.sqlite.bak.20260913_013000)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = src_path.with_name(f"{src_path.name}.bak.{timestamp}")
+    if _try_atomic_copy(candidate):
+        return candidate
+
+    # 3. Try incremented counter backups (e.g. data.sqlite.bak.20260913_013000_1)
+    counter = 1
+    while True:
+        candidate = src_path.with_name(f"{src_path.name}.bak.{timestamp}_{counter}")
+        if _try_atomic_copy(candidate):
+            return candidate
+        counter += 1
+
+
 def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> Tuple[int, int]:
     """Scan a SQLite database for credentials and optionally redact them in-place."""
     if not db_path.exists():
+        err_msg = f"Database file not found: {db_path}"
+        detector.record_error(err_msg)
+        print(f"  ⚠️ {err_msg}", file=sys.stderr)
         return 0, 0
 
     conn = None
@@ -597,9 +752,8 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
 
         # Apply fixes if requested
         if fix and modified_rows:
-            # Create backup before modification
-            backup_path = db_path.with_suffix(f"{db_path.suffix}.bak")
-            shutil.copy2(db_path, backup_path)
+            # Create backup atomically before modification (eliminates TOCTOU race conditions)
+            backup_path = _atomic_create_backup(db_path)
             print(f"  💾 Backup created: {backup_path}")
 
             try:
@@ -618,7 +772,9 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
                 )
                 raise
     except Exception as e:
-        print(f"  ⚠️ Error reading/updating SQLite DB {db_path}: {e}", file=sys.stderr)
+        err_msg = f"Error reading/updating SQLite DB {db_path}: {e}"
+        detector.record_error(err_msg)
+        print(f"  ⚠️ {err_msg}", file=sys.stderr)
     finally:
         if conn:
             conn.close()
@@ -644,7 +800,9 @@ def scan_json_or_text_file(file_path: Path, detector: LeakDetector) -> Tuple[int
             detector.findings.extend(hits)
             leaks_found = len(hits)
     except Exception as e:
-        print(f"  ⚠️ Error reading file {file_path}: {e}", file=sys.stderr)
+        err_msg = f"Error reading file {file_path}: {e}"
+        detector.record_error(err_msg)
+        print(f"  ⚠️ {err_msg}", file=sys.stderr)
 
     return records_checked, leaks_found
 
@@ -674,9 +832,14 @@ def main():
 
     # Determine paths to scan
     target_paths = []
+    missing_paths = []
     if args.paths:
         for p in args.paths:
-            target_paths.append(Path(p).expanduser().resolve())
+            target_p = Path(p).expanduser().resolve()
+            if not target_p.exists():
+                missing_paths.append(p)
+            else:
+                target_paths.append(target_p)
     else:
         # Default scan locations
         hermes_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser().resolve()
@@ -687,11 +850,18 @@ def main():
     # Deduplicate paths
     target_paths = list(dict.fromkeys(target_paths))
 
-    # Auto-collect real secrets from all profiles (.env, auth.json, etc.)
-    known_secrets = collect_known_secrets(target_paths)
-    detector = LeakDetector(known_secrets=known_secrets)
+    detector = LeakDetector()
     total_records = 0
     scanned_files = 0
+
+    for p in missing_paths:
+        err_msg = f"Target path does not exist: {p}"
+        detector.record_error(err_msg)
+        print(f"  ⚠️ {err_msg}", file=sys.stderr)
+
+    # Auto-collect real secrets from all profiles (.env, auth.json, etc.)
+    known_secrets = collect_known_secrets(target_paths, errors=detector.errors)
+    detector.known_secrets = known_secrets
 
     if not args.json:
         print("🔍 Scanning for credential leaks...")
@@ -763,13 +933,26 @@ def main():
             "scanned_files": scanned_files,
             "total_records_checked": total_records,
             "total_leaks_found": len(detector.findings),
+            "scan_errors": len(detector.errors),
             "findings": detector.findings,
+            "errors": detector.errors,
         }
         print(json.dumps(output, ensure_ascii=False, indent=2))
-        return
+        if detector.errors:
+            sys.exit(2)
+        elif detector.findings:
+            sys.exit(1)
+        else:
+            sys.exit(0)
 
     # CLI Output formatting
     print("-" * 70)
+    if detector.errors:
+        print(f"⚠️ ENCOUNTERED {len(detector.errors)} SCAN ERROR(S):")
+        for idx, err in enumerate(detector.errors, start=1):
+            print(f"  [{idx}] {err}")
+        print("-" * 70)
+
     if detector.findings:
         print(f"🚨 FOUND {len(detector.findings)} POTENTIAL CREDENTIAL LEAK(S):")
         print("-" * 70)
@@ -784,10 +967,19 @@ def main():
             print("✅ All findings in SQLite DBs have been redacted and backed up.")
         else:
             print("💡 Tip: Run with `--fix` to automatically redact credentials in SQLite DBs.")
-    else:
+    elif not detector.errors:
         print("✅ No credential leaks found! All scanned databases and logs are clean.")
+    else:
+        print("⚠️ Scan completed with errors. Cleanliness cannot be guaranteed.")
     print("-" * 70)
     print(f"Summary: Checked {scanned_files} file(s) across {total_records} record/line entries.\n")
+
+    if detector.errors:
+        sys.exit(2)
+    elif detector.findings:
+        sys.exit(1)
+    else:
+        sys.exit(0)
 
 
 if __name__ == "__main__":

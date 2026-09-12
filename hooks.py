@@ -172,6 +172,43 @@ def _looks_like_secret(value: str) -> bool:
     return False
 
 
+_SENSITIVE_KEY_SUBSTRINGS = (
+    "password", "passwd", "token", "secret", "api_key", "apikey", "auth_key",
+    "private_key", "db_pass", "database_url", "credential", "access_key", "bearer",
+    "パスワード", "トークン", "シークレット", "apiキー", "認証情報", "認証キー"
+)
+
+
+def _is_sensitive_key(key_name: str) -> bool:
+    """Check if key name strongly indicates a sensitive secret or password."""
+    if not key_name:
+        return False
+    k = key_name.lower().replace("-", "_")
+    return any(sub in k for sub in _SENSITIVE_KEY_SUBSTRINGS)
+
+
+def _should_mask_value(key_name: str, value: str) -> bool:
+    """Determine if a value should be masked, taking key context into account.
+
+    - Rejects documentation placeholders and already masked values.
+    - Accepts genuine secrets by entropy/structure heuristics (_looks_like_secret).
+    - For strongly sensitive keys (e.g. password, token, secret), masks values of at least 4 characters
+      even if low-entropy or short (e.g. 'admin123', 'simplepass').
+    """
+    if not value or not isinstance(value, str):
+        return False
+    clean_val = value.strip("\"'`<>[]{}")
+    if not clean_val or _is_placeholder(clean_val):
+        return False
+    if _looks_like_secret(clean_val):
+        return True
+    if _is_sensitive_key(key_name) and len(clean_val) >= 4 and clean_val.isascii():
+        if clean_val.lower() in ("true", "false", "null", "none"):
+            return False
+        return True
+    return False
+
+
 def _apply_direct_patterns(text: str) -> str:
     """Apply compiled regex patterns from patterns.PATTERNS."""
     result = text
@@ -181,19 +218,20 @@ def _apply_direct_patterns(text: str) -> str:
 
 
 def _replace_kv_if_secret(match: re.Match) -> str:
-    """Replace value in KEY=val only if it looks like a secret."""
+    """Replace value in KEY=val only if it looks like a secret or sensitive key."""
     key_name = match.group(1)
     val = match.group(2)
-    if _looks_like_secret(val):
+    if _should_mask_value(key_name, val):
         return f"{key_name}=***"
     return match.group(0)
 
 
 def _replace_json_if_secret(match: re.Match) -> str:
-    """Replace JSON value only if it looks like a secret."""
+    """Replace JSON value only if it looks like a secret or sensitive key."""
     key_prefix = match.group(1)
+    key_name = match.group(2)
     val = match.group(3)
-    if _looks_like_secret(val):
+    if _should_mask_value(key_name, val):
         return f'{key_prefix}"***"'
     return match.group(0)
 
@@ -235,13 +273,14 @@ def redact_tool_result(tool_name: str, result: str, **kwargs) -> str | None:
     # 4. Redact YAML/colon key-value fields
     def _replace_yaml(m):
         prefix = m.group(1)
-        val = m.group(2)
-        if _looks_like_secret(val):
+        key_name = m.group(2)
+        val = m.group(3)
+        if _should_mask_value(key_name, val):
             return f"{prefix}***"
         return m.group(0)
 
     result = re.sub(
-        rf'(?m)^(\s*{_SECRET_KEY_REGEX}\s*:\s*)["\']?([^"\'\s\n]+)["\']?',
+        rf'(?m)^([^\S\r\n]*({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?\s*$',
         _replace_yaml,
         result,
         flags=re.IGNORECASE
@@ -288,13 +327,14 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
     # Redact YAML/colon key-value fields in LLM output
     def _replace_yaml_llm(m):
         prefix = m.group(1)
-        val = m.group(2)
-        if _looks_like_secret(val):
+        key_name = m.group(2)
+        val = m.group(3)
+        if _should_mask_value(key_name, val):
             return f"{prefix}***"
         return m.group(0)
 
     result = re.sub(
-        rf'(?m)^(\s*{_SECRET_KEY_REGEX}\s*:\s*)["\']?([^"\'\s\n]+)["\']?',
+        rf'(?m)^([^\S\r\n]*({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?\s*$',
         _replace_yaml_llm,
         result,
         flags=re.IGNORECASE
@@ -303,8 +343,9 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
     # 3. Natural language credential references (meta-discussion)
     def _nl_replacer(m):
         if len(m.groups()) >= 2:
+            key_name = m.group(1)
             potential_secret = m.group(2)
-            if potential_secret != "***" and _looks_like_secret(potential_secret):
+            if potential_secret != "***" and _should_mask_value(key_name, potential_secret):
                 return m.group(0).replace(potential_secret, "***", 1)
         return m.group(0)
 
@@ -341,7 +382,7 @@ def redact_terminal_output(command: str | None, output: str, **kwargs) -> str | 
         def _replace_env_secret(m):
             key = m.group(1)
             val = m.group(2)
-            if _looks_like_secret(val) or (not _is_placeholder(val) and len(val.strip("\"'")) >= 4):
+            if _should_mask_value(key, val):
                 return f"{key}=***"
             return m.group(0)
 

@@ -387,6 +387,455 @@ profiles:
         except ImportError:
             self.skipTest("Hermes agent source not found in standard location")
 
+    def test_scan_json_output_does_not_leak_raw_secrets(self):
+        """Verify --json output NEVER leaks raw plaintext secrets in findings or JSON payload."""
+        import json
+        import subprocess
+        import tempfile
+
+        scan_script = Path(__file__).resolve().parent.parent / "scan_credentials.py"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_file = Path(tmpdir) / "leaky.txt"
+            secret_ghp = "ghp_1234567890abcdefghijklmnopqrstuvwxyz"
+            secret_pwd = "mySuperSecretPassword123"
+            test_file.write_text(
+                f"token: {secret_ghp}\npassword = {secret_pwd}\n",
+                encoding="utf-8"
+            )
+
+            res = subprocess.run(
+                [sys.executable, str(scan_script), str(test_file), "--json"],
+                capture_output=True,
+                text=True
+            )
+
+            # Exit code should be 1 because leak was detected
+            self.assertEqual(res.returncode, 1)
+
+            data = json.loads(res.stdout)
+            self.assertEqual(data["total_leaks_found"], 2)
+            self.assertEqual(data["scan_errors"], 0)
+
+            # Check that raw_match does not exist anywhere in findings, and match is strictly '***'
+            for finding in data["findings"]:
+                self.assertNotIn("raw_match", finding)
+                self.assertEqual(finding["match"], "***")
+                self.assertIn("raw_length", finding)
+
+            # Check that raw plaintext secrets and their prefixes/suffixes are NOT present in JSON stdout
+            self.assertNotIn(secret_ghp, res.stdout)
+            self.assertNotIn(secret_ghp[:6], res.stdout)
+            self.assertNotIn(secret_pwd, res.stdout)
+            self.assertNotIn(secret_pwd[:6], res.stdout)
+
+    def test_low_entropy_password_detection_and_redaction(self):
+        """Verify low-entropy passwords with sensitive keys are detected and redacted across all layers."""
+        from hooks import redact_tool_result, redact_llm_output
+        from scan_credentials import LeakDetector
+
+        # 1. Tool result (JSON & YAML & KEY=VALUE)
+        raw_json = '{"user": "alice", "password": "admin123", "status": "ok"}'
+        redacted_json = redact_tool_result("api_call", raw_json)
+        self.assertIsNotNone(redacted_json)
+        self.assertNotIn("admin123", redacted_json)
+        self.assertIn('"password": "***"', redacted_json)
+
+        raw_yaml = "auth:\n  password: simplepassword\n  role: admin"
+        redacted_yaml = redact_tool_result("cat_config", raw_yaml)
+        self.assertIsNotNone(redacted_yaml)
+        self.assertNotIn("simplepassword", redacted_yaml)
+        self.assertIn("password: ***", redacted_yaml)
+
+        # 2. LLM output (Natural language English & Japanese)
+        en_out = "The temporary password is simplepass1."
+        redacted_en = redact_llm_output(en_out)
+        self.assertIsNotNone(redacted_en)
+        self.assertNotIn("simplepass1", redacted_en)
+        self.assertIn("***", redacted_en)
+
+        ja_out = "新しいパスワードは simplepass2 に変更されました。"
+        redacted_ja = redact_llm_output(ja_out)
+        self.assertIsNotNone(redacted_ja)
+        self.assertNotIn("simplepass2", redacted_ja)
+        self.assertIn("***", redacted_ja)
+
+        # 3. Scanner LeakDetector
+        detector = LeakDetector()
+        text = 'db_password = "weakpassword123"'
+        hits = detector.scan_text(text, {"source_file": "config.py"})
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["type"], "KeyValue (db_password)")
+        self.assertEqual(hits[0]["match"], "***")
+        self.assertNotIn("raw_match", hits[0])
+
+        sanitized = detector.sanitize_text(text)
+        self.assertEqual(sanitized, 'db_password = "***"')
+
+        # 4. Placeholders should NOT be redacted
+        placeholder_json = '{"password": "<your-password>", "token": "dummy"}'
+        self.assertIsNone(redact_tool_result("api_call", placeholder_json))
+
+    def test_cli_exit_codes(self):
+        """Verify CLI exit codes: 0 for clean, 1 for leak detected, 2 for scan errors."""
+        import subprocess
+        import tempfile
+
+        scan_script = Path(__file__).resolve().parent.parent / "scan_credentials.py"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Case 1: Clean file -> exit code 0
+            clean_file = Path(tmpdir) / "clean.txt"
+            clean_file.write_text("hello world\nno secrets here\n", encoding="utf-8")
+            res_clean = subprocess.run(
+                [sys.executable, str(scan_script), str(clean_file)],
+                capture_output=True,
+                text=True
+            )
+            self.assertEqual(res_clean.returncode, 0)
+            self.assertIn("No credential leaks found", res_clean.stdout)
+
+            # Case 2: Leaked file -> exit code 1
+            leaked_file = Path(tmpdir) / "leaked.txt"
+            leaked_file.write_text("password = admin123\n", encoding="utf-8")
+            res_leak = subprocess.run(
+                [sys.executable, str(scan_script), str(leaked_file)],
+                capture_output=True,
+                text=True
+            )
+            self.assertEqual(res_leak.returncode, 1)
+            self.assertIn("FOUND 1 POTENTIAL CREDENTIAL LEAK", res_leak.stdout)
+
+            # Case 3: Non-existent path -> exit code 2
+            missing_path = Path(tmpdir) / "nonexistent_file.txt"
+            res_missing = subprocess.run(
+                [sys.executable, str(scan_script), str(missing_path)],
+                capture_output=True,
+                text=True
+            )
+            self.assertEqual(res_missing.returncode, 2)
+            self.assertIn("ENCOUNTERED 1 SCAN ERROR", res_missing.stdout)
+
+    def test_backup_preserves_existing_bak(self):
+        """Verify that existing .bak files are not overwritten when redacting SQLite DBs."""
+        import subprocess
+        import tempfile
+        import sqlite3
+
+        scan_script = Path(__file__).resolve().parent.parent / "scan_credentials.py"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "data.sqlite"
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, note TEXT);")
+            cur.execute("INSERT INTO users (note) VALUES ('secret token: ghp_1234567890abcdefghijklmnopqrstuvwxyz');")
+            conn.commit()
+            conn.close()
+
+            # Pre-create an existing .bak file with special content
+            orig_bak = Path(tmpdir) / "data.sqlite.bak"
+            orig_bak.write_text("ORIGINAL_HEALTHY_BACKUP", encoding="utf-8")
+
+            # Run --fix
+            res = subprocess.run(
+                [sys.executable, str(scan_script), str(db_path), "--fix"],
+                capture_output=True,
+                text=True
+            )
+
+            # The original .bak must be preserved intact!
+            self.assertEqual(orig_bak.read_text(encoding="utf-8"), "ORIGINAL_HEALTHY_BACKUP")
+
+            # A new timestamped backup must have been created
+            new_backups = list(Path(tmpdir).glob("data.sqlite.bak.*"))
+            self.assertEqual(len(new_backups), 1)
+            self.assertTrue(new_backups[0].exists())
+
+    def test_mask_secret_full_mask(self):
+        """Verify mask_secret strictly outputs '***' for any secret without leaking prefixes or suffixes."""
+        from scan_credentials import mask_secret
+
+        self.assertEqual(mask_secret("admin123"), "***")
+        self.assertEqual(mask_secret("1234567890"), "***")
+        self.assertEqual(mask_secret("secret_pass"), "***")
+        self.assertEqual(mask_secret("123456789012"), "***")
+        self.assertEqual(mask_secret("ghp_1234567890abcdefghijklmnopqrstuvwxyz"), "***")
+        self.assertEqual(mask_secret("AKIAIOSFODNN7EXAMPLE"), "***")
+
+    def test_broken_auth_file_reports_error(self):
+        """Verify that a corrupted auth.json / .env file is reported as a scan error (exit code 2)."""
+        import json
+        import subprocess
+        import tempfile
+
+        scan_script = Path(__file__).resolve().parent.parent / "scan_credentials.py"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a broken JSON auth file
+            broken_auth = Path(tmpdir) / "auth.json"
+            broken_auth.write_text("{\"key\": \"unclosed json...", encoding="utf-8")
+
+            res = subprocess.run(
+                [sys.executable, str(scan_script), str(tmpdir), "--json"],
+                capture_output=True,
+                text=True
+            )
+
+            # Exit code must be 2 because scan encountered a configuration error
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+            self.assertTrue(any("auth.json" in err for err in data["errors"]))
+
+    def test_backup_preserves_existing_bak_even_on_same_second_collision(self):
+        """Verify that multiple backups created within the same second use incremented counters and don't overwrite."""
+        import subprocess
+        import tempfile
+        import sqlite3
+        from datetime import datetime
+
+        scan_script = Path(__file__).resolve().parent.parent / "scan_credentials.py"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "data.sqlite"
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, note TEXT);")
+            cur.execute("INSERT INTO users (note) VALUES ('secret token: ghp_1234567890abcdefghijklmnopqrstuvwxyz');")
+            conn.commit()
+            conn.close()
+
+            # Pre-create standard .bak and a timestamped backup that simulates current second
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            orig_bak = Path(tmpdir) / "data.sqlite.bak"
+            orig_bak.write_text("ORIGINAL_STANDARD_BACKUP", encoding="utf-8")
+            orig_ts_bak = Path(tmpdir) / f"data.sqlite.bak.{ts}"
+            orig_ts_bak.write_text("ORIGINAL_TIMESTAMPED_BACKUP", encoding="utf-8")
+
+            # Run --fix
+            res = subprocess.run(
+                [sys.executable, str(scan_script), str(db_path), "--fix"],
+                capture_output=True,
+                text=True
+            )
+
+            # Both pre-existing files must be untouched
+            self.assertEqual(orig_bak.read_text(encoding="utf-8"), "ORIGINAL_STANDARD_BACKUP")
+            self.assertEqual(orig_ts_bak.read_text(encoding="utf-8"), "ORIGINAL_TIMESTAMPED_BACKUP")
+
+            # A counter-appended backup (e.g. *.bak.<ts>_1) must exist
+            incremented_backups = list(Path(tmpdir).glob(f"data.sqlite.bak.{ts}_*"))
+            self.assertGreaterEqual(len(incremented_backups), 1)
+
+    def test_corrupted_yaml_reports_error(self):
+        """Verify that a corrupted YAML config/auth file reports a scan error (exit code 2),
+
+        even when valid secret lines are present or PyYAML is not installed.
+        """
+        import json
+        import subprocess
+        import tempfile
+
+        scan_script = Path(__file__).resolve().parent.parent / "scan_credentials.py"
+
+        # Case 1: Corrupted YAML with invalid indentation and unclosed bracket
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_yaml = Path(tmpdir) / "config.yaml"
+            broken_yaml.write_text("service:\n  invalid_indent:\n- bad: [unclosed", encoding="utf-8")
+
+            res = subprocess.run(
+                [sys.executable, str(scan_script), str(tmpdir), "--json"],
+                capture_output=True,
+                text=True
+            )
+
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+            self.assertTrue(any("config.yaml" in err for err in data["errors"]))
+
+        # Case 2: Corrupted YAML that mixes a valid secret key with broken syntax
+        # Ensures syntax error is never swallowed even if lines match key: value format
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_yaml_with_secret = Path(tmpdir) / "config.yaml"
+            broken_yaml_with_secret.write_text(
+                "app:\n  api_key: \"sk-1234567890abcdef12345678\"\n  broken_colon_no_space:bad\n  broken_list:\n[unclosed",
+                encoding="utf-8"
+            )
+
+            res = subprocess.run(
+                [sys.executable, str(scan_script), str(tmpdir), "--json"],
+                capture_output=True,
+                text=True
+            )
+
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+            self.assertTrue(any("config.yaml" in err for err in data["errors"]))
+
+        # Case 3: Pure-Python fallback parser directly raises ValueError on corrupted YAML without PyYAML
+        from unittest.mock import patch
+        from scan_credentials import collect_known_secrets, _parse_yaml_fallback
+
+        with self.assertRaises(ValueError):
+            _parse_yaml_fallback("service:\n  bad_syntax:\n- missing: [unclosed")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_yaml_no_pyyaml = Path(tmpdir) / "config.yaml"
+            broken_yaml_no_pyyaml.write_text("service:\n  bad_indent:\n- err: [test", encoding="utf-8")
+            errors_list = []
+            with patch.dict("sys.modules", {"yaml": None}):
+                collect_known_secrets([Path(tmpdir)], errors=errors_list)
+            self.assertGreaterEqual(len(errors_list), 1)
+            self.assertTrue(any("config.yaml" in err for err in errors_list))
+
+    def test_malformed_env_reports_error(self):
+        """Verify that .env files with various syntax errors (missing '=', unclosed quotes, empty keys,
+
+        broken continuation lines, invalid key names) report scan error (exit code 2).
+        """
+        import json
+        import subprocess
+        import tempfile
+
+        scan_script = Path(__file__).resolve().parent.parent / "scan_credentials.py"
+
+        # Case 1: Missing '='
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_env = Path(tmpdir) / ".env"
+            broken_env.write_text("VALID_VAR=12345678\nTHIS_LINE_HAS_NO_EQUALS_SIGN\nANOTHER_VAR=abc", encoding="utf-8")
+
+            res = subprocess.run([sys.executable, str(scan_script), str(tmpdir), "--json"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+            self.assertTrue(any(".env" in err for err in data["errors"]))
+
+        # Case 2: Unclosed quote (start quote without matching end quote, or single dangling quote)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_env = Path(tmpdir) / ".env"
+            broken_env.write_text('API_KEY="unclosed_secret_string\nVALID=123', encoding="utf-8")
+
+            res = subprocess.run([sys.executable, str(scan_script), str(tmpdir), "--json"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_env = Path(tmpdir) / ".env"
+            broken_env.write_text('API_KEY="\nVALID=123', encoding="utf-8")
+
+            res = subprocess.run([sys.executable, str(scan_script), str(tmpdir), "--json"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+
+        # Case 3: Empty key
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_env = Path(tmpdir) / ".env"
+            broken_env.write_text("=orphan_value\n", encoding="utf-8")
+
+            res = subprocess.run([sys.executable, str(scan_script), str(tmpdir), "--json"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+
+        # Case 4: Broken continuation line (trailing backslash without valid continuation)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_env = Path(tmpdir) / ".env"
+            broken_env.write_text("API_KEY=value_with_broken_continuation\\\n", encoding="utf-8")
+
+            res = subprocess.run([sys.executable, str(scan_script), str(tmpdir), "--json"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+            self.assertTrue(any("continuation" in err for err in data["errors"]))
+
+        # Case 5: Invalid key name (starts with digit or contains illegal characters/spaces)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_env = Path(tmpdir) / ".env"
+            broken_env.write_text("123_INVALID_KEY_NAME=secret123\n", encoding="utf-8")
+
+            res = subprocess.run([sys.executable, str(scan_script), str(tmpdir), "--json"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+            self.assertTrue(any("invalid key name" in err for err in data["errors"]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_env = Path(tmpdir) / ".env"
+            broken_env.write_text("INVALID KEY WITH SPACES=secret123\n", encoding="utf-8")
+
+            res = subprocess.run([sys.executable, str(scan_script), str(tmpdir), "--json"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+            self.assertTrue(any("invalid key name" in err for err in data["errors"]))
+
+    def test_atomic_backup_concurrent_toctou_prevention(self):
+        """Verify that _atomic_create_backup safely handles concurrent callers without TOCTOU race conditions."""
+        import tempfile
+        import concurrent.futures
+        from scan_credentials import _atomic_create_backup
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_file = Path(tmpdir) / "test.db"
+            src_file.write_text("DATABASE_CONTENT_TEST", encoding="utf-8")
+
+            # Concurrently create 10 backups of the same file
+            num_workers = 10
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(_atomic_create_backup, src_file) for _ in range(num_workers)]
+                created_paths = [f.result() for f in futures]
+
+            # All created backup paths must be unique
+            self.assertEqual(len(set(created_paths)), num_workers)
+            # All files must exist and contain the original content intact
+            for p in created_paths:
+                self.assertTrue(p.exists())
+                self.assertEqual(p.read_text(encoding="utf-8"), "DATABASE_CONTENT_TEST")
+
+    def test_error_messages_do_not_leak_secret_snippets(self):
+        """Verify that syntax error messages in YAML and .env NEVER leak secret fragments or raw snippets in --json errors."""
+        import json
+        import subprocess
+        import tempfile
+
+        scan_script = Path(__file__).resolve().parent.parent / "scan_credentials.py"
+
+        # 1. Test .env syntax error with real-looking secret
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_env = Path(tmpdir) / ".env"
+            secret_env = "sk-superSecretEnvTokenVal1234567890"
+            broken_env.write_text(f'API_KEY="{secret_env}\n', encoding="utf-8")
+
+            res = subprocess.run([sys.executable, str(scan_script), str(tmpdir), "--json"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+
+            # Neither the full secret nor its prefix snippet should exist in stdout or errors
+            self.assertNotIn(secret_env, res.stdout)
+            self.assertNotIn(secret_env[:10], res.stdout)
+            for err in data["errors"]:
+                self.assertNotIn(secret_env, err)
+                self.assertNotIn(secret_env[:10], err)
+
+        # 2. Test YAML syntax error with real-looking secret
+        with tempfile.TemporaryDirectory() as tmpdir:
+            broken_yaml = Path(tmpdir) / "config.yaml"
+            secret_yaml = "ghp_yamlSecretBrokenVal1234567890abcdef"
+            broken_yaml.write_text(f'auth:\n  token: [{secret_yaml}\n', encoding="utf-8")
+
+            res = subprocess.run([sys.executable, str(scan_script), str(tmpdir), "--json"], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2)
+            data = json.loads(res.stdout)
+            self.assertGreaterEqual(data["scan_errors"], 1)
+
+            # Neither the full secret nor its prefix snippet should exist in stdout or errors
+            self.assertNotIn(secret_yaml, res.stdout)
+            self.assertNotIn(secret_yaml[:10], res.stdout)
+            for err in data["errors"]:
+                self.assertNotIn(secret_yaml, err)
+                self.assertNotIn(secret_yaml[:10], err)
+
 
 if __name__ == "__main__":
     unittest.main()
