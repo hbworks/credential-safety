@@ -1,4 +1,5 @@
 """Tests for credential safety plugin."""
+import os
 import re
 import unittest
 import sys
@@ -214,7 +215,8 @@ backlog:
     def test_all_patterns_acceptable_by_hermes_core(self):
         """Verify that 100% of patterns are accepted by Hermes core register_redaction_patterns if present."""
         try:
-            sys.path.insert(0, "/Users/masato/.hermes/hermes-agent")
+            hermes_home = os.environ.get("HERMES_HOME", "").strip() or os.path.expanduser("~/.hermes")
+            sys.path.insert(0, os.path.join(hermes_home, "hermes-agent"))
             from agent.redact import register_redaction_patterns
             accepted = register_redaction_patterns(patterns.PATTERNS, source="test_suite")
             self.assertEqual(accepted, len(patterns.PATTERNS))
