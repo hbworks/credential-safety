@@ -15,17 +15,19 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Try importing patterns from package, current directory, or script directory
+# Try importing patterns and hooks from package, current directory, or script directory
 try:
-    from . import patterns
+    from . import patterns, hooks
 except (ImportError, ValueError):
     try:
         import patterns
+        import hooks
     except ImportError:
         script_dir = str(Path(__file__).resolve().parent)
         if script_dir not in sys.path:
             sys.path.insert(0, script_dir)
         import patterns
+        import hooks
 
 # Detection Patterns compiled from patterns.PATTERNS
 # (?i) などのインラインフラグを除いた実際の先頭文字列でホワイトリストを判定する
@@ -56,8 +58,9 @@ PATTERNS = [
 
 
 
+# Key-Value credential pattern (synchronized with hooks._SECRET_KEY_REGEX)
 SECRET_KEY_REGEX = re.compile(
-    r"[\"']?(?<![a-zA-Z0-9_])(api[_-]?key|password|passwd|auth[_-]?token|access[_-]?token|refresh[_-]?token|secret[_-]?key|secret|token)(?![a-zA-Z0-9_])[\"']?\s*[:=]\s*[\"']?([^'\"\s\n,})\];>]+)[\"']?",
+    rf"[\"']?(?<![a-zA-Z0-9_])({hooks._SECRET_KEY_REGEX})(?![a-zA-Z0-9_])[\"']?\s*[:=]\s*[\"']?([^'\"\s\n,}}\)\];>]+)[\"']?",
     re.IGNORECASE
 )
 
@@ -109,120 +112,12 @@ def is_intended_auth_file(file_path: Path) -> bool:
 
 
 
-PLACEHOLDER_PREFIXES = (
-    "your-", "your_", "my-", "my_", "example-", "example_", "sample-", "sample_",
-    "test-", "test_", "dummy-", "dummy_", "insert-", "insert_", "replace-", "replace_",
-    "enter-", "enter_", "set-", "set_", "change-me", "changeme", "todo-", "todo_",
-    "<your", "<api", "<token", "<secret", "<password"
-)
-
-PLACEHOLDER_KEYWORDS = {
-    "changed", "hidden", "required", "optional", "example", "default", "secret", "string",
-    "undefined", "none", "null", "true", "false", "password", "bearer", "token", "apikey",
-    "value", "content", "config", "status", "created", "updated", "deleted", "masked",
-    "redacted", "placeholder", "dummy", "sample", "test", "admin", "user", "guest",
-    "your-api-key", "your-admin-api-key", "your_api_key", "api_key_here", "your_token_here",
-    "your-token", "your_secret", "your-secret", "your-password", "your_password"
-}
-
-
-def _shannon_entropy(s: str) -> float:
-    """Calculate Shannon entropy of a string."""
-    if not s:
-        return 0.0
-    import math
-    freq = {}
-    for c in s:
-        freq[c] = freq.get(c, 0) + 1
-    return -sum((count / len(s)) * math.log2(count / len(s)) for count in freq.values())
-
-
-def looks_like_secret(value: str) -> bool:
-    """Accurate heuristic: detect genuine credentials and reject placeholders, code & words."""
-    if not value or len(value) < 8:
-        return False
-
-    # Real credentials (API keys, hashes, tokens, passwords) are strictly ASCII
-    if not value.isascii():
-        return False
-
-    val_clean = value.strip("\"'`<>[]{}")
-    val_lower = val_clean.lower()
-
-
-    # 1. Reject already masked / truncated values (e.g. 'sk-123...456', '***', '..')
-    if ".." in val_clean or "***" in val_clean or "<" in val_clean or ">" in val_clean:
-        return False
-
-    # 2. Reject code syntax & expressions (e.g. array indexing samples[0], func(x), obj.prop)
-    if any(c in val_clean for c in "[](){}+=;,\\"):
-        return False
-
-    # 3. Exact match ignored / placeholder words
-    if val_lower in PLACEHOLDER_KEYWORDS:
-        return False
-
-    # 4. Starts with placeholder prefix (e.g. 'your-admin-key', 'example_token')
-    if any(val_lower.startswith(p) for p in PLACEHOLDER_PREFIXES):
-        return False
-
-    # 5. Trailing '_here', '-here', '_key', '-key' without digits
-    if val_lower.endswith(("_here", "-here", "_key", "-key", "_token", "-token", "_secret", "-secret")) and not re.search(r"[0-9]", val_clean):
-        return False
-
-
-    # 5. Known real credential prefixes (override heuristics)
-    if any(val_clean.startswith(p) for p in (
-        "AKIA", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-",
-        "AIza", "ya29.", "hf_", "SG.", "xox", "xapp-", "sk_live_", "rk_live_", "sk_test_", "rk_test_"
-    )):
-        return True
-
-    # Twilio SID / API Key (34 chars starting with AC / SK followed by hex)
-    if (val_clean.startswith("AC") or val_clean.startswith("SK")) and len(val_clean) == 34 and re.fullmatch(r"[A-Za-z0-9]+", val_clean):
-        return True
-
-
-    if val_clean.startswith("sk-"):
-        # Reject machine learning libraries (sk-learn, sk-image, etc.) or pure word sequences without digits
-        if any(val_lower.startswith(p) for p in ("sk-learn", "sk-image", "sk-time", "sk-spatial", "sk-opt", "sk-video")):
-            return False
-        if not re.search(r"[0-9]", val_clean) or len(val_clean) < 20:
-            return False
-        return True
-
-
-
-
-    # 6. Hex strings (20+ hex characters, e.g. md5/sha or raw hex tokens)
-    if len(val_clean) >= 20 and re.fullmatch(r"[0-9a-fA-F]+", val_clean):
-        return True
-
-    # 7. Character class analysis
-    has_lower = bool(re.search(r"[a-z]", val_clean))
-    has_upper = bool(re.search(r"[A-Z]", val_clean))
-    has_digit = bool(re.search(r"[0-9]", val_clean))
-    has_special = bool(re.search(r"[^a-zA-Z0-9]", val_clean))
-
-    # Reject if it contains ONLY letters and dashes/underscores with NO digits (kebab-case / snake_case placeholder)
-    if (has_lower or has_upper) and not has_digit:
-        other_specials = re.sub(r"[a-zA-Z\-_]", "", val_clean)
-        if not other_specials:
-            return False
-
-    class_count = sum([has_lower, has_upper, has_digit, has_special])
-
-    # 3+ character classes with high entropy (e.g. Lower+Upper+Digit or Lower+Digit+Special)
-    if class_count >= 3 and len(val_clean) >= 8:
-        if _shannon_entropy(val_clean) >= 2.8:
-            return True
-
-    # 2 classes with digits and high entropy (12+ chars)
-    if has_digit and class_count >= 2 and len(val_clean) >= 12:
-        if _shannon_entropy(val_clean) >= 3.0:
-            return True
-
-    return False
+# Re-export and delegate directly to hooks for single source of truth (DRY)
+looks_like_secret = hooks._looks_like_secret
+_shannon_entropy = hooks._shannon_entropy
+_is_placeholder = hooks._is_placeholder
+PLACEHOLDER_PREFIXES = hooks.PLACEHOLDER_PREFIXES
+PLACEHOLDER_KEYWORDS = hooks.PLACEHOLDER_KEYWORDS
 
 
 
@@ -624,22 +519,22 @@ class LeakDetector:
         return result
 
 
-
-
+def _quote_ident(name: str) -> str:
+    """Safely quote a SQLite table or column identifier."""
+    return '"' + name.replace('"', '""') + '"'
 
 
 def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> Tuple[int, int]:
-    """Scan all text columns in all tables of a SQLite DB.
+    """Scan a SQLite database for credentials and optionally redact them in-place."""
+    if not db_path.exists():
+        return 0, 0
 
-    Uses cursor streaming to minimize memory consumption on large tables,
-    and wraps --fix modifications in strict transaction blocks with automatic rollback.
-    """
+    conn = None
     records_checked = 0
     leaks_found = 0
-    conn = None
 
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(str(db_path))
         cursor = conn.cursor()
 
         # Get all tables
@@ -649,8 +544,9 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
         modified_rows = []
 
         for table in tables:
+            tbl_quoted = _quote_ident(table)
             # Get table info (columns) with quoted table name
-            cursor.execute(f'PRAGMA table_info("{table}");')
+            cursor.execute(f'PRAGMA table_info({tbl_quoted});')
             cols_info = cursor.fetchall()
 
             # Get text/blob columns
@@ -660,15 +556,15 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
 
             # Check if rowid is supported (most tables), otherwise fallback to primary key column
             try:
-                cursor.execute(f'SELECT rowid FROM "{table}" LIMIT 1;')
+                cursor.execute(f'SELECT rowid FROM {tbl_quoted} LIMIT 1;')
                 cursor.fetchone()
                 pk_select = "rowid"
             except Exception:
                 pk_col = next((c[1] for c in cols_info if c[5] > 0), col_names[0])
-                pk_select = f'"{pk_col}"'
+                pk_select = _quote_ident(pk_col)
 
-            query_cols = ", ".join(f'"{c}"' for c in col_names)
-            cursor.execute(f'SELECT {pk_select}, {query_cols} FROM "{table}";')
+            query_cols = ", ".join(_quote_ident(c) for c in col_names)
+            cursor.execute(f'SELECT {pk_select}, {query_cols} FROM {tbl_quoted};')
 
             # Stream rows one by one to avoid large memory footprint on massive tables
             for row in cursor:
@@ -685,6 +581,7 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
                         hits = detector.scan_text(val, {
                             "source_file": str(db_path),
                             "location": f"Table: {table} | Row ID: {row_id} | Column: {col_name}",
+                            "column": col_name,
                         })
                         if hits:
                             detector.findings.extend(hits)
@@ -708,9 +605,10 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
             try:
                 with conn:
                     for table, pk_sel, row_id, updates in modified_rows:
-                        set_clause = ", ".join(f'"{k}" = ?' for k in updates.keys())
+                        tbl_q = _quote_ident(table)
+                        set_clause = ", ".join(f'{_quote_ident(k)} = ?' for k in updates.keys())
                         values = list(updates.values()) + [row_id]
-                        cursor.execute(f'UPDATE "{table}" SET {set_clause} WHERE {pk_sel} = ?;', values)
+                        cursor.execute(f'UPDATE {tbl_q} SET {set_clause} WHERE {pk_sel} = ?;', values)
                 print(f"  ✨ Redacted & updated {len(modified_rows)} row(s) in {db_path.name}")
             except Exception as update_err:
                 conn.rollback()

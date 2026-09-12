@@ -249,6 +249,26 @@ backlog:
         self.assertNotIn("mySecretTokenValue123456=", sanitized)
         self.assertIn("***", sanitized)
 
+    def test_scanner_sync_base64_and_expanded_keys(self):
+        """Should detect and sanitize Base64 secrets and expanded keys via LeakDetector."""
+        from scan_credentials import LeakDetector
+
+        detector = LeakDetector()
+        text = (
+            "SECRET_KEY=k7+ABc1234567890def==\n"
+            "client_secret: dGVzdCt2YWx1ZTEyMzQ1Ng==\n"
+            "Normal text with foo..bar placeholder\n"
+        )
+        findings = detector.scan_text(text, {"source_file": "app.env", "location": "Line 1-3"})
+        self.assertGreaterEqual(len(findings), 2)
+
+        sanitized = detector.sanitize_text(text)
+        self.assertNotIn("k7+ABc1234567890def==", sanitized)
+        self.assertNotIn("dGVzdCt2YWx1ZTEyMzQ1Ng==", sanitized)
+        self.assertIn("foo..bar", sanitized)
+        self.assertIn("SECRET_KEY=***", sanitized)
+        self.assertIn("client_secret: ***", sanitized)
+
     def test_scan_sqlite_db_stream_and_fix(self):
         """Should stream SQLite rows, detect secrets, create backup, and redact in-place."""
         import tempfile
