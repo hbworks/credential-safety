@@ -1,5 +1,188 @@
 # Credential Safety Plugin for Hermes Agent
 
+[ English | [日本語](#japanese) ]
+
+A multi-layer security plugin designed to prevent credential (API keys, tokens, passwords) leaks across the Hermes Agent lifecycle.  
+Directly addresses and patches the vulnerability reported in [GitHub Issue #20785](https://github.com/NousResearch/hermes-agent/issues/20785) regarding plaintext credential leakage in chat responses and reasoning blocks during meta-discussions and bugfix reports.
+
+---
+
+## 🎯 Background & Problem (Why Prompt Guardrails Fail)
+
+1. **The Meta-Discussion Trap**:
+   * When an agent resolves a credential leak, it frequently quotes the original plaintext secret during its debrief (e.g., "I updated the password from `secret_val` to ...").
+2. **Exposed Reasoning Blocks (`<think>`)**:
+   * In clients displaying thinking blocks (Discord, Telegram, CLI, Web UI), raw credentials referenced during intermediate reasoning steps are inadvertently leaked.
+3. **Fragility of System Prompt Instructions**:
+   * Negative prompting ("Never output secrets") degrades under complex reasoning and multi-turn conversations. **Deterministic, pipeline-level redaction at the I/O boundary** is required.
+
+---
+
+## ⚙️ Defense Architecture (4-Layer Pipeline)
+
+```
+[ Tool Execution / Terminal Output ]
+                 │
+                 ▼
+┌─────────────────────────────────────────┐
+│ Layer 1 & 2: Inbound Sanitization       │
+│  ・transform_tool_result                │
+│  ・transform_terminal_output            │
+│  → Masks .env / printenv / JSON values  │
+└─────────────────────────────────────────┘
+                 │
+                 ▼ (Secrets removed prior to model ingestion)
+┌─────────────────────────────────────────┐
+│ LLM Inference & Reasoning (<think>)     │
+└─────────────────────────────────────────┘
+                 │
+                 ▼ (Intercepted before transmission to client)
+┌─────────────────────────────────────────┐
+│ Layer 3: Outbound Sanitization          │
+│  ・transform_llm_output                 │
+│  → Well-known token pattern scanning    │
+│  → Natural language contextual redaction│
+│  → Mandatory masking inside <think> tags│
+└─────────────────────────────────────────┘
+                 │
+                 ▼
+[ User / Clients (CLI, Discord, Telegram, Web) ]
+```
+
+---
+
+### Layer Specifications
+
+#### 1. Tool Result Sanitization (`transform_tool_result`)
+* **Trigger**: Immediately after tool execution (file read, HTTP request, DB query).
+* **Behavior**: Replaces `KEY=VALUE` credentials with `***`, and sanitizes JSON fields (`api_key`, `secret`, `token`, etc.) while **preserving dictionary key names** (e.g., `"api_key": "***"`).
+* **Objective**: Prevents secrets from ever entering the LLM context memory.
+
+#### 2. Terminal Output Sanitization (`transform_terminal_output`)
+* **Trigger**: Upon capturing stdout/stderr from bash/shell tool executions.
+* **Behavior**: Sanitizes outputs from commands like `env`, `printenv`, `export`, and `cat .env`.
+
+#### 3. LLM Output & Reasoning Sanitization (`transform_llm_output`)
+* **Trigger**: After text generation, immediately prior to streaming or returning responses to the user.
+* **Behavior**:
+  1. **Well-Known Token Scan**: Regex matching for OpenAI, Anthropic, Google, AWS, GitHub, Slack, JWT, and Private Keys.
+  2. **Code Block / Config Scan**: Masks configuration keys within markdown code blocks.
+  3. **Natural Language / Meta-Discussion Redaction**: Pinpoint detection of expressions like "the password is `XXXX`" combined with Shannon entropy and character-class verification (`_looks_like_secret`).
+
+#### 4. Core Engine Registration (`ctx.register_redaction_patterns`)
+* **Trigger**: Plugin registration (`register(ctx)`).
+* **Behavior**: Registers custom regex patterns directly with the underlying Hermes redaction engine when supported.
+
+---
+
+## 📦 Supported Secret Formats
+
+* **AI & Cloud Providers**:
+  * OpenAI / Anthropic: `sk-...`, `sk-ant-...`, `sk-proj-...`
+  * Google: `AIza...` (Gemini/Maps/Firebase), `ya29...` (OAuth Access Token)
+  * HuggingFace: `hf_...`
+  * AWS: `AKIA[0-9A-Z]{16}`
+* **Code Hosting & CI/CD**:
+  * GitHub: `ghp_...`, `gho_...`, `ghu_...`, `ghs_...`, `ghr_...`, `github_pat_...` (Fine-grained PAT)
+  * GitLab: `glpat-...`
+* **SaaS & Communication APIs**:
+  * Stripe: `sk_live_...`, `rk_live_...`
+  * SendGrid: `SG....`
+  * Twilio: `SK...` (API Key SID), `AC...` (Account SID)
+  * Slack: `xoxb-...`, `xoxp-...`, `xapp-...`
+* **Standard Cryptographic & Auth Headers**:
+  * JWT Tokens: `eyJ...`
+  * Private Keys: `-----BEGIN RSA/EC/OPENSSH PRIVATE KEY-----`
+  * Authorization: `Bearer ...`
+* **Generic Configuration**: `API_KEY=...`, `PASSWORD=...`, `"token": "..."`
+
+---
+
+## 📁 Directory Structure
+
+```text
+credential-safety/
+├── __init__.py          # Plugin registration & entrypoint
+├── hooks.py             # 4-layer sanitization hooks implementation
+├── patterns.py          # Regex patterns and entropy validators
+├── plugin.yaml          # Plugin manifest
+├── scan_credentials.py  # Offline DB/log auditing & repair CLI tool
+├── tests/               # Test suite
+│   └── test_credential_safety.py
+└── README.md            # Documentation
+```
+
+---
+
+## 🚀 Installation & Setup
+
+### 1. Place the Plugin
+
+Install into Hermes Agent's plugin directory `~/.hermes/plugins/`:
+
+```bash
+mkdir -p ~/.hermes/plugins
+
+# Option A: Copy
+cp -r ./credential-safety ~/.hermes/plugins/
+
+# Option B: Symlink (Recommended)
+ln -s "$(pwd)/credential-safety" ~/.hermes/plugins/credential-safety
+```
+
+### 2. Enable in Profile Configuration
+
+Add `credential-safety` to `~/.hermes/config.yaml` or `~/.hermes/profiles/<profile_name>.yaml`:
+
+```yaml
+plugins:
+  - credential-safety
+```
+
+---
+
+## 🔍 Offline Database & Log Auditor (`scan_credentials.py`)
+
+A standalone CLI utility to scan existing SQLite databases and log files (JSON, JSONL, TXT) for lingering plaintext secrets. Operates with **zero external dependencies** (standard Python 3 library only).
+
+### Key Features
+1. **Config Extraction & Exact Matching**: Automatically parses authentic secrets from `~/.hermes/profiles/*/.env` and `auth.json`, cross-referencing databases with 0% false positives.
+2. **Heuristic Secret Detection**: Uses Shannon entropy analysis to detect ad-hoc passwords shared in historical conversations.
+3. **Safe In-Place Repair**: Automatically creates `.bak` backups before sanitizing SQLite records with `--fix`.
+
+### Usage
+
+```bash
+# 1. Audit scan (read-only)
+python3 credential-safety/scan_credentials.py
+
+# Scan a specific file or directory
+python3 credential-safety/scan_credentials.py ~/.hermes/history.sqlite ./logs/
+
+# 2. In-place redaction and repair
+python3 credential-safety/scan_credentials.py ~/.hermes/history.sqlite --fix
+
+# 3. Output as JSON for CI/CD pipelines
+python3 credential-safety/scan_credentials.py --json
+```
+
+---
+
+## 🧪 Running Unit Tests
+
+```bash
+python3 credential-safety/tests/test_credential_safety.py -v
+```
+
+<br>
+
+---
+<a id="japanese"></a>
+
+# Credential Safety Plugin for Hermes Agent (日本語)
+
+[ [English](#credential-safety-plugin-for-hermes-agent) | 日本語 ]
+
 Hermes Agent における認証情報（APIキー、トークン、パスワードなど）の漏洩を防止する多層防御セキュリティプラグインです。  
 [GitHub Issue #20785](https://github.com/NousResearch/hermes-agent/issues/20785) で報告された「チャット出力や思考/推論ブロック内での認証情報漏洩（特に修正報告等のメタディスカッション時）」に対するパッチ・防御機能を提供します。
 
