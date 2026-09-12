@@ -22,7 +22,11 @@ _NATURAL_LANGUAGE_PATTERNS = [
 
 
 # Common key names for KEY=VALUE / KEY: VALUE redaction
-_SECRET_KEY_REGEX = r"(?:api[_-]?key|password|passwd|token|secret|auth|access_token|private_key)"
+# Matches keys like SECRET_KEY, CLIENT_SECRET, AUTH_TOKEN, ACCESS_KEY, DATABASE_URL, etc.
+_SECRET_KEY_REGEX = (
+    r"(?:[a-zA-Z0-9_-]*(?:api[_-]?key|password|passwd|token|secret|auth|private_key|database_url|db_pass)[a-zA-Z0-9_-]*"
+    r"|access[_-]?key|signing[_-]?key|encryption[_-]?key|bearer[_-]?token|client[_-]?secret|app[_-]?secret)"
+)
 
 
 
@@ -61,8 +65,8 @@ def _is_placeholder(value: str) -> bool:
     val_clean = value.strip("\"'`<>[]{}")
     val_lower = val_clean.lower()
 
-    # 1. Reject already masked / truncated values (e.g. 'sk-123...456', '***', '..')
-    if ".." in val_clean or "***" in val_clean or "<" in val_clean or ">" in val_clean:
+    # 1. Reject already masked / truncated values (e.g. 'sk-123...456', '***', '...')
+    if "..." in val_clean or "***" in val_clean or "<" in val_clean or ">" in val_clean:
         return True
 
     # 2. Exact match ignored / placeholder words
@@ -96,7 +100,20 @@ def _looks_like_secret(value: str) -> bool:
         return False
 
     # Reject code syntax & expressions (e.g. array indexing samples[0], func(x), obj.prop)
-    if any(c in val_clean for c in "[](){}+=;,\\"):
+    # Notice: '+' and '=' are intentionally permitted for Base64 encoded secrets / padding
+    if any(c in val_clean for c in "[](){};,\\"):
+        return False
+
+    # '=' is strictly checked: valid only as trailing Base64 padding (at most 2 '=' at the end)
+    # Rejects code assignments or equations like 'a=b' or 'x==y'
+    if "=" in val_clean:
+        padding_stripped = val_clean.rstrip("=")
+        num_eq = len(val_clean) - len(padding_stripped)
+        if num_eq > 2 or "=" in padding_stripped:
+            return False
+
+    # '+' cannot appear at the start (e.g. '+1234' phone/offset) or with whitespace
+    if val_clean.startswith("+") or " " in val_clean:
         return False
 
     # Known real credential prefixes (override heuristics)
@@ -128,7 +145,6 @@ def _looks_like_secret(value: str) -> bool:
     has_digit = bool(re.search(r"[0-9]", val_clean))
     has_special = bool(re.search(r"[^a-zA-Z0-9]", val_clean))
 
-
     # Reject if it contains ONLY letters and dashes/underscores with NO digits (kebab-case / snake_case placeholder)
     if (has_lower or has_upper) and not has_digit:
         other_specials = re.sub(r"[a-zA-Z\-_]", "", val_clean)
@@ -136,6 +152,12 @@ def _looks_like_secret(value: str) -> bool:
             return False
 
     class_count = sum([has_lower, has_upper, has_digit, has_special])
+
+    # 8. Base64 encoded tokens / keys (e.g. standard cryptographic hashes, HMAC keys, bearer tokens)
+    # Character set: A-Z, a-z, 0-9, +, /, with 0-2 trailing '=' padding
+    if len(val_clean) >= 12 and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", val_clean):
+        if (has_digit or (has_lower and has_upper) or has_special) and _shannon_entropy(val_clean) >= 2.6:
+            return True
 
     # 3+ character classes with high entropy (e.g. Lower+Upper+Digit or Lower+Digit+Special)
     if class_count >= 3 and len(val_clean) >= 8:

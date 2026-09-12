@@ -136,6 +136,43 @@ class TestHooks(unittest.TestCase):
         self.assertIn("password: ***", redacted)
         self.assertIn("mode: production", redacted)
 
+    def test_looks_like_secret_base64(self):
+        """Should detect Base64 encoded secrets with + and = padding, and reject code equations."""
+        # Genuine Base64 secrets
+        self.assertTrue(hooks._looks_like_secret("k7+ABc1234567890def=="))
+        self.assertTrue(hooks._looks_like_secret("dGVzdCt2YWx1ZTEyMzQ1Ng=="))
+        self.assertTrue(hooks._looks_like_secret("aGVsbG8xMjM0NTY+"))
+
+        # Code syntax equations or assignments should be rejected
+        self.assertFalse(hooks._looks_like_secret("a=b"))
+        self.assertFalse(hooks._looks_like_secret("x==y"))
+        self.assertFalse(hooks._looks_like_secret("foo+bar=baz"))
+        self.assertFalse(hooks._looks_like_secret("+1234567890"))
+
+        # Non-placeholder values with double dots (not triple dots) should NOT be rejected as placeholders
+        self.assertFalse(hooks._is_placeholder("foo..bar"))
+        # Truncation ellipsis should be rejected as placeholder
+        self.assertTrue(hooks._is_placeholder("sk-proj-...456"))
+
+    def test_redact_expanded_secret_keys(self):
+        """Should redact expanded environment variables like SECRET_KEY, CLIENT_SECRET, DATABASE_URL."""
+        env_dump = (
+            "SECRET_KEY=k7+ABc1234567890def==\n"
+            "CLIENT_SECRET=client_secret_token_12345\n"
+            "AUTH_TOKEN=auth_super_secret_token_789\n"
+            "DATABASE_URL=postgres://user:super_secret_pass@localhost:5432/db\n"
+            "NORMAL_VAR=hello_world\n"
+        )
+        redacted = hooks.redact_tool_result("terminal", env_dump)
+        self.assertIsNotNone(redacted)
+        self.assertNotIn("k7+ABc1234567890def==", redacted)
+        self.assertNotIn("client_secret_token_12345", redacted)
+        self.assertNotIn("auth_super_secret_token_789", redacted)
+        self.assertIn("SECRET_KEY=***", redacted)
+        self.assertIn("CLIENT_SECRET=***", redacted)
+        self.assertIn("AUTH_TOKEN=***", redacted)
+        self.assertIn("NORMAL_VAR=hello_world", redacted)
+
     def test_redact_multiline_private_key(self):
         """Should redact multiline private keys."""
         priv_key = (
