@@ -16,7 +16,7 @@ Hermes Agent における認証情報（APIキー、トークン、パスワー�
 
 ---
 
-## ⚙️ 理論上の動作（多層防御アーキテクチャ）
+## ⚙️ 動作アーキテクチャ（4層の多層防御パイプライン）
 
 本プラグインは、以下の **4層の防御パイプライン** によって認証情報の流入・露出を遮断します。
 
@@ -70,7 +70,7 @@ Hermes Agent における認証情報（APIキー、トークン、パスワー�
 * **動作タイミング**: モデルがテキスト（最終回答および `<think>` 思考ブロック）を生成し、ユーザーへ配信する直前。
 * **動作内容**:
   1. **既知トークン直接スキャン**:
-     文脈によらず、OpenAI / Anthropic / AWS / GitHub / Slack / JWT / Private Key などのフォーマットを正規表現で検出し即座に `***` に置換。
+     文脈によらず、OpenAI / Anthropic / Google / AWS / GitHub / Slack / JWT / Private Key などのフォーマットを正規表現で検出し即座に `***` に置換。
   2. **コードブロック / 設定値置換**:
      モデルが出力したコードスニペット内の `KEY=value` や `key: value` をマスク。
   3. **メタディスカッション自然言語置換**:
@@ -104,19 +104,44 @@ Hermes Agent における認証情報（APIキー、トークン、パスワー�
   * Authorization Headers: `Bearer ...`
 * **汎用設定形式**: `API_KEY=...`, `PASSWORD=...`, `"token": "..."`
 
+---
+
+## 📁 ディレクトリ構成
+
+```text
+credential-safety/
+├── __init__.py          # プラグイン登録・エントリポイント
+├── hooks.py             # 4層サニタイズ処理・フック実装
+├── patterns.py          # トークン検知正規表現・エントロピー判定定義
+├── plugin.yaml          # プラグイン定義マニフェスト
+├── scan_credentials.py  # 過去DB・ログの監査＆修復CLIツール
+├── tests/               # ユニットテスト
+│   └── test_credential_safety.py
+└── README.md            # 本ドキュメント
+```
 
 ---
 
 ## 🚀 インストールと設定
 
 ### 1. プラグインの配置
-Hermes のプラグインディレクトリに配置します：
+
+Hermes Agent のプラグインディレクトリ `~/.hermes/plugins/` に配置します。
+
 ```bash
-cp -r credential-safety ~/.hermes/plugins/
+mkdir -p ~/.hermes/plugins
+
+# コピーして配置する場合
+cp -r ./credential-safety ~/.hermes/plugins/
+
+# またはシンボリックリンクで配置する場合
+ln -s "$(pwd)/credential-safety" ~/.hermes/plugins/credential-safety
 ```
 
 ### 2. プロファイルで有効化
-使用するプロファイル設定（`config.yaml` または `profiles/<profile_name>.yaml`）の `plugins` セクションに追加します：
+
+使用するプロファイル設定（`~/.hermes/config.yaml` または `~/.hermes/profiles/<profile_name>.yaml`）の `plugins` セクションに追加します：
+
 ```yaml
 plugins:
   - credential-safety
@@ -137,7 +162,6 @@ plugins:
    * 会話中にユーザーが直接教えたDBパスワードや動的発行トークンも、高精度シャノンエントロピー＋文字種分析で捕捉。
 3. **安全設計**:
    * `auth.json` や `.env` などの正規設定ファイル自体はスキャン対象外として保護され、`--fix` 時にも誤って上書き破壊されることはありません。
-
 
 ### 使い方
 
@@ -206,7 +230,6 @@ GITHUB_TOKEN=github_pat_11SampleToken01234567890ab_samplegithubtokenvalue1234567
 ```
 * **期待される結果**: トークンの値部分がピンポイントで `***` に置換されること。
 
-
 #### シナリオ④: 誤検知（False Positive）が起きないことの確認
 ドキュメント例やプレースホルダー値が正常に出力されることを確認します。
 ```text
@@ -228,7 +251,7 @@ python3 ~/.hermes/plugins/credential-safety/scan_credentials.py
 
 ```text
 🔍 Scanning for credential leaks...
-  • Target: /Users/masato/.hermes
+  • Target: ~/.hermes
   🔑 Loaded 12 authentic secret(s) from profile configs for exact-match tracking
 
 ----------------------------------------------------------------------
@@ -236,5 +259,3 @@ python3 ~/.hermes/plugins/credential-safety/scan_credentials.py
 ----------------------------------------------------------------------
 Summary: Checked 278 file(s) across 444,090 record/line entries.
 ```
-
-
