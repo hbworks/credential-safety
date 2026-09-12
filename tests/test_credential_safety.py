@@ -212,6 +212,113 @@ backlog:
         self.assertNotIn("mySecretTokenValue123456=", sanitized)
         self.assertIn("***", sanitized)
 
+    def test_scan_sqlite_db_stream_and_fix(self):
+        """Should stream SQLite rows, detect secrets, create backup, and redact in-place."""
+        import tempfile
+        import sqlite3
+        from scan_credentials import LeakDetector, scan_sqlite_db
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "chat_history.sqlite"
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT, content TEXT);")
+            secret = "sk-proj-superSecretTestKey12345678901234567890"
+            cur.execute("INSERT INTO messages (role, content) VALUES ('user', ?);", (f"My key is {secret}",))
+            cur.execute("INSERT INTO messages (role, content) VALUES ('assistant', 'Understood, no secret here');")
+            conn.commit()
+            conn.close()
+
+            detector = LeakDetector()
+            recs, leaks = scan_sqlite_db(db_path, detector, fix=True)
+
+            self.assertEqual(recs, 2)
+            self.assertEqual(leaks, 1)
+            self.assertTrue(db_path.with_suffix(f"{db_path.suffix}.bak").exists())
+
+            # Verify in-place redaction in DB
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT content FROM messages WHERE id = 1;")
+            updated_content = cur.fetchone()[0]
+            conn.close()
+
+            self.assertNotIn(secret, updated_content)
+            self.assertIn("***", updated_content)
+
+    def test_sqlite_transaction_rollback_on_error(self):
+        """Should rollback changes if an exception occurs during batch update."""
+        import tempfile
+        import sqlite3
+        from scan_credentials import LeakDetector, scan_sqlite_db
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test_rollback.sqlite"
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, note TEXT);")
+            secret = "sk-proj-superSecretTestKey12345678901234567890"
+            cur.execute("INSERT INTO records (note) VALUES (?);", (f"API key: {secret}",))
+            # Trigger abort on UPDATE to simulate write/constraint failure during transaction
+            cur.execute(
+                "CREATE TRIGGER abort_update BEFORE UPDATE ON records "
+                "BEGIN SELECT RAISE(ABORT, 'Simulated write failure'); END;"
+            )
+            conn.commit()
+            conn.close()
+
+            detector = LeakDetector()
+            # scan_sqlite_db catches error, rolls back transaction, prints error
+            recs, leaks = scan_sqlite_db(db_path, detector, fix=True)
+
+            # Check that content was rolled back and still contains original value
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT note FROM records WHERE id = 1;")
+            val = cur.fetchone()[0]
+            conn.close()
+
+            self.assertIn(secret, val)
+
+    def test_nested_yaml_fallback_without_pyyaml(self):
+        """Should accurately parse deeply nested YAML secrets using pure-Python fallback parser."""
+        import tempfile
+        from unittest.mock import patch
+        from scan_credentials import collect_known_secrets, _parse_yaml_fallback
+
+        yaml_content = """
+# Application Configuration
+service:
+  environment: production
+  auth:
+    deeply:
+      nested:
+        secret_token: "superSecretNestedToken12345"
+    subdomain: "corp-team"
+profiles:
+  - name: primary
+    api_key: "primaryApiKeySecret999"
+"""
+        # 1. Test fallback parser directly
+        parsed = _parse_yaml_fallback(yaml_content)
+        self.assertIn("service", parsed)
+        self.assertEqual(
+            parsed["service"]["auth"]["deeply"]["nested"]["secret_token"],
+            "superSecretNestedToken12345"
+        )
+
+        # 2. Test collect_known_secrets when PyYAML import fails
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg_file = Path(tmpdir) / "config.yaml"
+            cfg_file.write_text(yaml_content, encoding="utf-8")
+
+            with patch.dict("sys.modules", {"yaml": None}):
+                known = collect_known_secrets([Path(tmpdir)])
+
+            extracted_values = [v[0] for v in known]
+            self.assertIn("superSecretNestedToken12345", extracted_values)
+            self.assertIn("primaryApiKeySecret999", extracted_values)
+
     def test_all_patterns_acceptable_by_hermes_core(self):
         """Verify that 100% of patterns are accepted by Hermes core register_redaction_patterns if present."""
         try:

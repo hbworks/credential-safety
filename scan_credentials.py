@@ -271,6 +271,121 @@ def _is_valid_extracted_secret(key_name: str, value: str) -> bool:
     return looks_like_secret(value)
 
 
+def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
+    """Lightweight pure-Python fallback YAML parser supporting nested mappings.
+
+    Parses indentation-based nested YAML without requiring the external PyYAML package.
+    Supports comments, quoted strings, nested dictionaries, and list items.
+    """
+    root: Dict[str, Any] = {}
+    stack: List[Tuple[int, Any]] = [(-1, root)]
+
+    for raw_line in content.splitlines():
+        line_no_comment = raw_line
+        if "#" in raw_line:
+            in_quote = False
+            quote_char = ""
+            comment_idx = -1
+            for idx, ch in enumerate(raw_line):
+                if ch in ('"', "'"):
+                    if not in_quote:
+                        in_quote = True
+                        quote_char = ch
+                    elif quote_char == ch:
+                        in_quote = False
+                elif ch == "#" and not in_quote:
+                    comment_idx = idx
+                    break
+            if comment_idx != -1:
+                line_no_comment = raw_line[:comment_idx]
+
+        stripped = line_no_comment.strip()
+        if not stripped:
+            continue
+
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+
+        while len(stack) > 1 and stack[-1][0] >= indent:
+            stack.pop()
+
+        current_container = stack[-1][1]
+
+        # Check for list item "- key: value" or "- value"
+        if stripped.startswith("- "):
+            item_text = stripped[2:].strip()
+            colon_pos = -1
+            in_quote = False
+            quote_char = ""
+            for idx, ch in enumerate(item_text):
+                if ch in ('"', "'"):
+                    if not in_quote:
+                        in_quote = True
+                        quote_char = ch
+                    elif quote_char == ch:
+                        in_quote = False
+                elif ch == ":" and not in_quote:
+                    colon_pos = idx
+                    break
+
+            if colon_pos != -1:
+                k = item_text[:colon_pos].strip().strip("\"'")
+                v = item_text[colon_pos + 1:].strip()
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1]
+                item_dict = {k: v} if v else {}
+                if isinstance(current_container, list):
+                    current_container.append(item_dict)
+                elif isinstance(current_container, dict):
+                    current_container.setdefault("_items", []).append(item_dict)
+                if not v:
+                    stack.append((indent, item_dict))
+            else:
+                val = item_text.strip("\"'")
+                if isinstance(current_container, list):
+                    current_container.append(val)
+                elif isinstance(current_container, dict):
+                    current_container.setdefault("_items", []).append(val)
+            continue
+
+        # Check for key-value pair
+        colon_pos = -1
+        in_quote = False
+        quote_char = ""
+        for idx, ch in enumerate(stripped):
+            if ch in ('"', "'"):
+                if not in_quote:
+                    in_quote = True
+                    quote_char = ch
+                elif quote_char == ch:
+                    in_quote = False
+            elif ch == ":" and not in_quote:
+                colon_pos = idx
+                break
+
+        if colon_pos != -1:
+            key = stripped[:colon_pos].strip().strip("\"'")
+            val_part = stripped[colon_pos + 1:].strip()
+
+            if not val_part:
+                new_dict: Dict[str, Any] = {}
+                if isinstance(current_container, dict):
+                    current_container[key] = new_dict
+                elif isinstance(current_container, list):
+                    current_container.append({key: new_dict})
+                stack.append((indent, new_dict))
+            else:
+                if (val_part.startswith('"') and val_part.endswith('"')) or (val_part.startswith("'") and val_part.endswith("'")):
+                    val = val_part[1:-1]
+                else:
+                    val = val_part
+                if isinstance(current_container, dict):
+                    current_container[key] = val
+                elif isinstance(current_container, list):
+                    current_container.append({key: val})
+
+    return root
+
+
 def collect_known_secrets(scan_roots: List[Path]) -> List[Tuple[str, str, str]]:
     """Automatically collect real secret values from all profile .env and auth.json files.
 
@@ -325,7 +440,13 @@ def collect_known_secrets(scan_roots: List[Path]) -> List[Tuple[str, str, str]]:
                     except Exception:
                         pass
 
-                    if isinstance(parsed_yaml, (dict, list)):
+                    if not isinstance(parsed_yaml, (dict, list)):
+                        try:
+                            parsed_yaml = _parse_yaml_fallback(content)
+                        except Exception:
+                            parsed_yaml = None
+
+                    if isinstance(parsed_yaml, (dict, list)) and parsed_yaml:
                         _extract_from_dict(parsed_yaml)
                     else:
                         # Fallback line-based regex parser for YAML (no pyyaml dependency required)
@@ -508,9 +629,14 @@ class LeakDetector:
 
 
 def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> Tuple[int, int]:
-    """Scan all text columns in all tables of a SQLite DB."""
+    """Scan all text columns in all tables of a SQLite DB.
+
+    Uses cursor streaming to minimize memory consumption on large tables,
+    and wraps --fix modifications in strict transaction blocks with automatic rollback.
+    """
     records_checked = 0
     leaks_found = 0
+    conn = None
 
     try:
         conn = sqlite3.connect(db_path)
@@ -544,8 +670,8 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
             query_cols = ", ".join(f'"{c}"' for c in col_names)
             cursor.execute(f'SELECT {pk_select}, {query_cols} FROM "{table}";')
 
-            rows = cursor.fetchall()
-            for row in rows:
+            # Stream rows one by one to avoid large memory footprint on massive tables
+            for row in cursor:
                 records_checked += 1
                 row_id = row[0]
                 row_data = row[1:]
@@ -579,16 +705,25 @@ def scan_sqlite_db(db_path: Path, detector: LeakDetector, fix: bool = False) -> 
             shutil.copy2(db_path, backup_path)
             print(f"  💾 Backup created: {backup_path}")
 
-            for table, pk_sel, row_id, updates in modified_rows:
-                set_clause = ", ".join(f'"{k}" = ?' for k in updates.keys())
-                values = list(updates.values()) + [row_id]
-                cursor.execute(f'UPDATE "{table}" SET {set_clause} WHERE {pk_sel} = ?;', values)
-            conn.commit()
-            print(f"  ✨ Redacted & updated {len(modified_rows)} row(s) in {db_path.name}")
-
-        conn.close()
+            try:
+                with conn:
+                    for table, pk_sel, row_id, updates in modified_rows:
+                        set_clause = ", ".join(f'"{k}" = ?' for k in updates.keys())
+                        values = list(updates.values()) + [row_id]
+                        cursor.execute(f'UPDATE "{table}" SET {set_clause} WHERE {pk_sel} = ?;', values)
+                print(f"  ✨ Redacted & updated {len(modified_rows)} row(s) in {db_path.name}")
+            except Exception as update_err:
+                conn.rollback()
+                print(
+                    f"  ⚠️ Failed to update SQLite DB {db_path} (changes rolled back, backup available at {backup_path.name}): {update_err}",
+                    file=sys.stderr,
+                )
+                raise
     except Exception as e:
-        print(f"  ⚠️ Error reading SQLite DB {db_path}: {e}", file=sys.stderr)
+        print(f"  ⚠️ Error reading/updating SQLite DB {db_path}: {e}", file=sys.stderr)
+    finally:
+        if conn:
+            conn.close()
 
     return records_checked, leaks_found
 
