@@ -60,7 +60,7 @@ Directly addresses and patches the vulnerability reported in [GitHub Issue #2078
 
 #### 2. Terminal Output Sanitization (`transform_terminal_output`)
 * **Trigger**: Upon capturing stdout/stderr from bash/shell tool executions.
-* **Behavior**: Sanitizes outputs from commands like `env`, `printenv`, `export`, and `cat .env`.
+* **Behavior**: Sanitizes environment-variable dumps and output from commands that display credential files.
 
 #### 3. LLM Output & Reasoning Sanitization (`transform_llm_output`)
 * **Trigger**: After text generation, immediately prior to streaming or returning responses to the user.
@@ -247,7 +247,7 @@ Hermes Agent における認証情報（APIキー、トークン、パスワー�
 #### 2. ターミナル出力のサニタイズ (`transform_terminal_output`)
 * **動作タイミング**: シェルコマンド実行の標準出力・標準エラー出力取得時。
 * **動作内容**:
-  * `env`, `printenv`, `export`, `cat .env` などの環境変数・機密ファイル表示コマンドの出力を検出・サニタイズ。
+  * 環境変数ダンプや機密設定ファイルを表示するコマンドの出力を検出・サニタイズ。
 
 #### 3. LLM出力・思考プロセスのサニタイズ (`transform_llm_output`)
 * **動作タイミング**: モデルがテキスト（最終回答および `<think>` 思考ブロック）を生成し、ユーザーへ配信する直前。
@@ -400,7 +400,7 @@ Hermes を起動し、以下のプロンプトをチャットに入力してエ�
 #### シナリオ②: ツール実行結果（環境変数ダンプの遮断テスト）
 ターミナルツールで機密情報を含む出力をさせた際のマスキングを確認します。
 ```text
-ターミナルで echo "MY_SECRET_KEY=sk-1234567890abcdef1234567890abcdef" を実行して結果を見せて
+ターミナルで `MY_SECRET_KEY=<sample-value>` を出力して結果を見せて
 ```
 * **期待される結果**: ツール実行結果の表示が `MY_SECRET_KEY=***` にマスクされてチャットに届くこと。
 
