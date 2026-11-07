@@ -911,5 +911,83 @@ class TestCoverageGaps(unittest.TestCase):
         self.assertIn("2|user: bob", redacted)
 
 
+class TestReviewFixes(unittest.TestCase):
+    """Regressions for the 2026-11 review findings (numeric settings, layer parity, YAML, Bearer)."""
+
+    def test_numeric_settings_are_not_masked(self):
+        from hooks import _should_mask_value
+        for key, value in (("max_tokens", "32768"),
+                           ("proactive_prune_min_reclaim_tokens", "4096"),
+                           ("max_output_tokens", "8192")):
+            self.assertFalse(_should_mask_value(key, value), msg="%s treated as a secret" % key)
+        for key, value in (("db_password", "admin123"),
+                           ("api_key", "sk-proj-QwErTy1234567890"),
+                           ("token", "token1234567890")):
+            self.assertTrue(_should_mask_value(key, value), msg="%s no longer masked" % key)
+
+    def test_scanner_shares_hook_patterns(self):
+        import scan_credentials as S
+        import hooks as H
+        self.assertEqual([p for _, p in S.PATTERNS], [p for _, p in H.COMPILED_PATTERNS])
+        self.assertEqual(S.NATURAL_LANG_REGEX, list(H._NL_COMPILED))
+
+    def test_scanner_matches_hook_prose_and_glued_tokens(self):
+        import scan_credentials as S
+        import hooks as H
+        cases = ("api key is Zx9Qw8Er7Ty6Ui5Op4 done",
+                 "xxghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8")
+        for text in cases:
+            self.assertIsNotNone(H.redact_tool_result("t", text), msg="hook missed: %s" % text)
+            self.assertTrue(S.LeakDetector().scan_text(text, {}), msg="scanner missed: %s" % text)
+
+    def test_yaml_fallback_block_scalar_and_multidoc(self):
+        from scan_credentials import _parse_yaml_fallback
+        parsed = _parse_yaml_fallback("auth:\n  token: |\n    blockval12345\n  name: x\n")
+        self.assertEqual(parsed["auth"]["token"], "blockval12345")
+        self.assertEqual(parsed["auth"]["name"], "x")
+
+        folded = _parse_yaml_fallback("auth:\n  secret: >-\n    folded12345\n")
+        self.assertEqual(folded["auth"]["secret"], "folded12345")
+
+        multi = _parse_yaml_fallback("a:\n  token: first12345\n---\nb:\n  token: second12345\n")
+        self.assertEqual(multi["a"]["token"], "first12345")
+        self.assertEqual(multi["b"]["token"], "second12345")
+
+    def test_yaml_fallback_flow_map_list_items_and_json(self):
+        from scan_credentials import _parse_yaml_fallback
+        flow = _parse_yaml_fallback("auth: {api_key: flowval12345, name: svc}\n")
+        self.assertEqual(flow["auth"]["api_key"], "flowval12345")
+        self.assertEqual(flow["auth"]["name"], "svc")
+
+        listed = _parse_yaml_fallback(
+            "keys:\n  - name: a\n    api_key: listval12345\n  - name: b\n    api_key: listval67890\n")
+        self.assertEqual([i["api_key"] for i in listed["keys"]], ["listval12345", "listval67890"])
+
+        js = _parse_yaml_fallback('{"auth": {"token": "jsonval12345"}}')
+        self.assertEqual(js["auth"]["token"], "jsonval12345")
+
+    def test_yaml_fallback_empty_value_is_null(self):
+        from scan_credentials import _parse_yaml_fallback
+        parsed = _parse_yaml_fallback("auth:\n  token:\n  name: x\n")
+        # A key with no value is null (models as None or an empty mapping, never an error)
+        self.assertIn(parsed["auth"]["token"], (None, {}))
+        self.assertEqual(parsed["auth"]["name"], "x")
+
+    def test_yaml_parser_reexport_contract(self):
+        import scan_credentials as S
+        import yaml_fallback
+        self.assertIs(S._parse_yaml_fallback, yaml_fallback.parse_yaml)
+        self.assertEqual(yaml_fallback.parse_yaml("a:\n  token: v12345678\n"),
+                         {"a": {"token": "v12345678"}})
+
+    def test_bearer_fixture_not_flagged_real_token_is(self):
+        import scan_credentials as S
+        for text in ("Authorization: Bearer test-tok-abc",
+                     "Authorization: Bearer your-token-here",
+                     "Authorization: Bearer example-abc-def"):
+            self.assertFalse(S.LeakDetector().scan_text(text, {}), msg="false positive: %s" % text)
+        self.assertTrue(S.LeakDetector().scan_text("Authorization: Bearer ab12cd34ef56gh78", {}))
+
+
 if __name__ == "__main__":
     unittest.main()

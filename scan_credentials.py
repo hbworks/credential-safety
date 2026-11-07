@@ -18,42 +18,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Try importing patterns and hooks from package, current directory, or script directory
 try:
-    from . import patterns, hooks
+    from . import patterns, hooks, yaml_fallback
 except (ImportError, ValueError):
     try:
         import patterns
         import hooks
+        import yaml_fallback
     except ImportError:
         script_dir = str(Path(__file__).resolve().parent)
         if script_dir not in sys.path:
             sys.path.insert(0, script_dir)
         import patterns
         import hooks
+        import yaml_fallback
 
 # Detection Patterns compiled from patterns.PATTERNS
 # (?i) などのインラインフラグを除いた実際の先頭文字列でホワイトリストを判定する
 # ※ 正規表現内の \. は実文字 . に相当するため、両方向でチェックする
-_NO_WORD_BOUNDARY_PREFIXES = (
-    r"\b", "-----", "Bearer", "bearer", "Authorization", "authorization",
-    "ya29.", "SG.", "xapp-", "xox", "(?:",
-)
-
-def _compile_pattern(p: str) -> re.Pattern:
-    """patterns.PATTERNS の各文字列を適切に compile する。
-    (?i) 等のインラインフラグや . を含む先頭パターンは \b を付与せず compile する。
-    """
-    # インラインフラグ (?i), (?m) 等を除去して実質的な先頭を取得
-    stripped = re.sub(r"^\(\?[imsx]+\)", "", p)
-    # 正規表現の \. → 実文字 . に変換（ホワイトリスト比較用）
-    stripped_plain = stripped.replace(r"\.", ".")
-    if any(stripped_plain.startswith(pfx) for pfx in _NO_WORD_BOUNDARY_PREFIXES):
-        return re.compile(p)
-    return re.compile(rf"\b(?:{p})\b")
-
-PATTERNS = [
-    ("Known Secret Pattern", _compile_pattern(p))
-    for p in patterns.PATTERNS
-]
+# Direct-signature patterns are compiled once in hooks (single source of truth). The hook
+# layers and this scanner share the same compiled objects, so a pattern edit can never apply
+# to one surface and not the other.
+PATTERNS = [("Known Secret Pattern", pat) for _, pat in hooks.compiled_direct_patterns()]
 
 
 
@@ -66,10 +51,8 @@ SECRET_KEY_REGEX = re.compile(
 )
 
 
-NATURAL_LANG_REGEX = [
-    re.compile(r"(?i)(?<![a-zA-Z0-9_])(password|token|api[_-]?key|secret|auth)(?![a-zA-Z0-9_])(?:\s+(?:is|was|used|changed|set|updated|generated|configured))*(?:\s*(?:is|was|to|for|as|into|:|:=|=|：))+\s*['\"]?([^\s'\"!.,;:]+)['\"]?(?:\s|\.|$|,|!|。|;)"),
-    re.compile(r"(パスワード|トークン|シークレット|APIキー|認証情報|認証キー)(?:\s*(?:は|を|に|へ|で|：|:|=|として))+\s*['\"]?([a-zA-Z0-9_\-.~!@#$%^&*+/=]{8,})['\"]?"),
-]
+# Natural-language patterns come from hooks as well: one definition, two surfaces.
+NATURAL_LANG_REGEX = list(hooks._NL_COMPILED)
 
 
 
@@ -169,172 +152,9 @@ def _is_valid_extracted_secret(key_name: str, value: str) -> bool:
     return looks_like_secret(value)
 
 
-def _parse_yaml_fallback(content: str) -> Dict[str, Any]:
-    """Lightweight pure-Python fallback YAML parser supporting nested mappings with syntax validation.
-
-    Parses indentation-based nested YAML without requiring the external PyYAML package.
-    Supports comments, quoted strings, nested dictionaries, and list items.
-    Validates indentation hierarchy, bracket matching, quotes, and forbidden tabs.
-    """
-    root: Dict[str, Any] = {}
-    stack: List[Tuple[int, Any, Optional[str]]] = [(-1, root, None)]
-    expecting_indent_after: Optional[Tuple[int, str, int]] = None
-
-    for line_num, raw_line in enumerate(content.splitlines(), start=1):
-        # 1. Reject tab characters in indentation
-        leading_spaces = len(raw_line) - len(raw_line.lstrip(" "))
-        if "\t" in raw_line[:leading_spaces + 1]:
-            raise ValueError(f"Line {line_num}: Tab characters are forbidden in YAML indentation")
-
-        # Strip comments outside quotes
-        line_no_comment = raw_line
-        if "#" in raw_line:
-            in_quote = False
-            quote_char = ""
-            comment_idx = -1
-            for idx, ch in enumerate(raw_line):
-                if ch in ('"', "'"):
-                    if not in_quote:
-                        in_quote = True
-                        quote_char = ch
-                    elif quote_char == ch:
-                        in_quote = False
-                elif ch == "#" and not in_quote:
-                    comment_idx = idx
-                    break
-            if comment_idx != -1:
-                line_no_comment = raw_line[:comment_idx]
-
-        stripped = line_no_comment.strip()
-        if not stripped:
-            continue
-
-        indent = len(raw_line) - len(raw_line.lstrip(" "))
-
-        # 2. Check if this line satisfies required indent from preceding mapping key without value
-        if expecting_indent_after is not None:
-            parent_indent, parent_key, parent_line = expecting_indent_after
-            if indent <= parent_indent:
-                raise ValueError(
-                    f"Line {line_num}: Bad indentation after mapping key (line {parent_line}); "
-                    f"expected indent > {parent_indent}, found {indent}"
-                )
-            expecting_indent_after = None
-
-        # 3. Check for unclosed brackets or braces in line (only outside quotes)
-        in_q = False
-        q_c = ""
-        open_b = 0
-        open_c = 0
-        for ch in stripped:
-            if ch in ('"', "'"):
-                if not in_q:
-                    in_q = True
-                    q_c = ch
-                elif q_c == ch:
-                    in_q = False
-            elif not in_q:
-                if ch == "[":
-                    open_b += 1
-                elif ch == "]":
-                    open_b -= 1
-                elif ch == "{":
-                    open_c += 1
-                elif ch == "}":
-                    open_c -= 1
-
-        if open_b != 0 or open_c != 0:
-            raise ValueError(f"Line {line_num}: Unclosed brackets or braces in YAML")
-
-        while len(stack) > 1 and stack[-1][0] >= indent:
-            stack.pop()
-
-        current_container = stack[-1][1]
-
-        # Check for list item "- key: value" or "- value"
-        if stripped.startswith("- "):
-            item_text = stripped[2:].strip()
-            colon_pos = -1
-            in_quote = False
-            quote_char = ""
-            for idx, ch in enumerate(item_text):
-                if ch in ('"', "'"):
-                    if not in_quote:
-                        in_quote = True
-                        quote_char = ch
-                    elif quote_char == ch:
-                        in_quote = False
-                elif ch == ":" and not in_quote:
-                    if idx + 1 == len(item_text) or item_text[idx + 1] in (" ", "\t"):
-                        colon_pos = idx
-                        break
-
-            if colon_pos != -1:
-                k = item_text[:colon_pos].strip().strip("\"'")
-                v = item_text[colon_pos + 1:].strip()
-                if (v.startswith('"') and not v.endswith('"')) or (v.startswith("'") and not v.endswith("'")) or (len(v) == 1 and v in ('"', "'")):
-                    raise ValueError(f"Line {line_num}: Unclosed quotes in YAML list value")
-                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
-                    v = v[1:-1]
-                item_dict = {k: v} if v else {}
-                if isinstance(current_container, list):
-                    current_container.append(item_dict)
-                elif isinstance(current_container, dict):
-                    current_container.setdefault("_items", []).append(item_dict)
-                if not v:
-                    stack.append((indent, item_dict, k))
-                    expecting_indent_after = (indent, k, line_num)
-            else:
-                val = item_text.strip("\"'")
-                if isinstance(current_container, list):
-                    current_container.append(val)
-                elif isinstance(current_container, dict):
-                    current_container.setdefault("_items", []).append(val)
-            continue
-
-        # Check for key-value pair
-        colon_pos = -1
-        in_quote = False
-        quote_char = ""
-        for idx, ch in enumerate(stripped):
-            if ch in ('"', "'"):
-                if not in_quote:
-                    in_quote = True
-                    quote_char = ch
-                elif quote_char == ch:
-                    in_quote = False
-            elif ch == ":" and not in_quote:
-                if idx + 1 == len(stripped) or stripped[idx + 1] in (" ", "\t"):
-                    colon_pos = idx
-                    break
-
-        if colon_pos != -1:
-            key = stripped[:colon_pos].strip().strip("\"'")
-            val_part = stripped[colon_pos + 1:].strip()
-
-            if not val_part:
-                new_dict: Dict[str, Any] = {}
-                if isinstance(current_container, dict):
-                    current_container[key] = new_dict
-                elif isinstance(current_container, list):
-                    current_container.append({key: new_dict})
-                stack.append((indent, new_dict, key))
-                expecting_indent_after = (indent, key, line_num)
-            else:
-                if (val_part.startswith('"') and not val_part.endswith('"')) or (val_part.startswith("'") and not val_part.endswith("'")) or (len(val_part) == 1 and val_part in ('"', "'")):
-                    raise ValueError(f"Line {line_num}: Unclosed quotes in YAML value")
-                if (val_part.startswith('"') and val_part.endswith('"')) or (val_part.startswith("'") and val_part.endswith("'")):
-                    val = val_part[1:-1]
-                else:
-                    val = val_part
-                if isinstance(current_container, dict):
-                    current_container[key] = val
-                elif isinstance(current_container, list):
-                    current_container.append({key: val})
-        else:
-            raise ValueError(f"Line {line_num}: Invalid YAML syntax (missing colon or unrecognized item)")
-
-    return root
+# YAML parsing lives in yaml_fallback.py (pure functions, no I/O); re-exported under the
+# historical private name so existing callers and tests keep working.
+_parse_yaml_fallback = yaml_fallback.parse_yaml
 
 
 def collect_known_secrets(scan_roots: List[Path], errors: Optional[List[str]] = None) -> List[Tuple[str, str, str]]:

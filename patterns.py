@@ -7,8 +7,10 @@ PATTERNS = [
     r"custom_api_key_[0-9a-f]{40,}",
 
     # Standard Auth Headers (explicit literal prefixes to satisfy core pre-screen)
-    r"Bearer\s+(?!None\b|null\b|undefined\b|your-)[A-Za-z0-9\-._~+/]{10,}=*",
-    r"bearer\s+(?!None\b|null\b|undefined\b|your-)[A-Za-z0-9\-._~+/]{10,}=*",
+    # A placeholder word or an all-letter human-readable fixture ("test-token-abc") is not a
+    # credential: require at least one digit in the token body.
+    r"Bearer\s+(?!None\b|null\b|undefined\b|your-|test-|fake-|dummy-|example-|sample-|placeholder)(?=[A-Za-z0-9\-._~+/]*[0-9])[A-Za-z0-9\-._~+/]{10,}=*",
+    r"bearer\s+(?!None\b|null\b|undefined\b|your-|test-|fake-|dummy-|example-|sample-|placeholder)(?=[A-Za-z0-9\-._~+/]*[0-9])[A-Za-z0-9\-._~+/]{10,}=*",
 
     # AI & Cloud Provider Keys (wrapped in group to avoid top-level alternation)
     r"sk-(?:(?:proj-|ant-|api03-|live-|test-)[A-Za-z0-9_\-]{20,}|[A-Za-z0-9]{32,})", # OpenAI / Anthropic

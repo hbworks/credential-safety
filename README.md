@@ -107,6 +107,7 @@ credential-safety/
 ├── patterns.py          # Regex patterns and entropy validators
 ├── plugin.yaml          # Plugin manifest
 ├── scan_credentials.py  # Offline DB/log auditing & repair CLI tool
+├── yaml_fallback.py     # Dependency-free YAML reader (pure functions, no I/O)
 ├── tests/               # Test suite
 │   └── test_credential_safety.py
 └── README.md            # Documentation
@@ -301,6 +302,7 @@ credential-safety/
 ├── patterns.py          # トークン検知正規表現・エントロピー判定定義
 ├── plugin.yaml          # プラグイン定義マニフェスト
 ├── scan_credentials.py  # 過去DB・ログの監査＆修復CLIツール
+├── yaml_fallback.py     # 依存なしのYAMLリーダー（純粋関数・I/Oなし）
 ├── tests/               # ユニットテスト
 │   └── test_credential_safety.py
 └── README.md            # 本ドキュメント
@@ -447,6 +449,37 @@ Summary: Checked 278 file(s) across 444,090 record/line entries.
 ```
 
 ## 📝 Changelog
+
+### v1.0.3
+Structural change, no behaviour change: the dependency-free YAML reader moved out of
+`scan_credentials.py` into `yaml_fallback.py` (289 lines, pure functions, no I/O).
+`scan_credentials._parse_yaml_fallback` remains as a re-export, so the CLI, the test
+suite, and any external caller keep working unchanged. The scanner drops from 1,071
+to 803 lines; the single highest-complexity unit (≈76 branches) now has its own module
+and test seam.
+
+### v1.0.2
+Review follow-up (correctness + maintainability):
+
+* **Numeric settings are no longer masked.** `max_tokens: 32768`,
+  `proactive_prune_min_reclaim_tokens: 4096` and similar values under a token-ish
+  key stayed as configuration; core leaves them alone and now so does this plugin.
+  A digit-only value is never treated as a credential by the key-name heuristic
+  (long hex/hash-looking runs are still caught).
+* **One pattern set, two surfaces.** `scan_credentials` now imports the compiled
+  direct-signature and natural-language patterns from `hooks` instead of keeping
+  its own copy — the scanner had silently kept the pre-1.0.1 prose pattern
+  (`api_key` but not `api key`) and a `\b(?:…)\b` wrapper the hooks never used.
+* **YAML fallback stops raising on valid YAML.** Block scalars (`|`, `>-`),
+  multi-document files (`---`), and null values no longer surface as scan errors
+  (exit 2). Flow mappings (`{a: 1}`) and JSON-style documents are parsed instead
+  of silently dropped, and list items keep every element instead of only the last
+  one.
+* **Patterns are compiled once** at import (`_RE_*`, `COMPILED_PATTERNS`,
+  `_NL_COMPILED`) rather than rebuilt as f-strings on every tool call.
+* **`Bearer` no longer flags fixtures.** The pattern now skips placeholder words
+  and requires a digit in the token body, so `Bearer test-tok-abc` in source or
+  docs is not reported as a leak.
 
 ### v1.0.1
 Hermes core now ships `agent/redact.py` (ON by default) covering vendor-prefixed

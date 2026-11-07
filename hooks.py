@@ -19,6 +19,9 @@ _NATURAL_LANGUAGE_PATTERNS = [
     r"(パスワード|トークン|シークレット|APIキー|認証情報|認証キー)(?:\s*(?:は|を|に|へ|で|：|:|=|として))+\s*['\"]?([a-zA-Z0-9_\-.~!@#$%^&*+/=]{8,})['\"]?",
 ]
 
+# Compiled once; the offline scanner reuses this tuple instead of its own copy.
+_NL_COMPILED = tuple(re.compile(p) for p in _NATURAL_LANGUAGE_PATTERNS)
+
 
 
 # Common key names for KEY=VALUE / KEY: VALUE redaction
@@ -29,6 +32,33 @@ _SECRET_KEY_REGEX = (
 )
 
 
+
+# Precompiled patterns for the hook passes. Compiling once at import avoids rebuilding an
+# f-string pattern on every tool call and removes reliance on re's internal 512-entry cache.
+_WS = r"[^\S\r\n]*"
+_LN = rf"(?:[0-9]{{1,7}}[|:]{_WS})?"
+_RE_KV_TOOL = re.compile(rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\\]+)", re.IGNORECASE)
+_RE_KV_ANY = re.compile(rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\\\"']+)", re.IGNORECASE)
+_RE_ENV_KV = re.compile(
+    r"([A-Z_0-9]*(?:password|token|api[_-]?key|secret|auth)[A-Z_0-9]*)\s*=\s*([^\s\n\\\"']+)",
+    re.IGNORECASE,
+)
+_RE_JSON = re.compile(rf'("({_SECRET_KEY_REGEX})"\s*:\s*)"([^"]+)"', re.IGNORECASE)
+_RE_YAML_EOL = re.compile(
+    rf'(?m)^({_WS}{_LN}({_SECRET_KEY_REGEX}){_WS}:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?\s*$',
+    re.IGNORECASE,
+)
+_RE_YAML_LINE = re.compile(
+    rf'(?m)^({_WS}{_LN}({_SECRET_KEY_REGEX}){_WS}:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?[^\S\r\n]*$',
+    re.IGNORECASE,
+)
+_RE_ESC_JSON = re.compile(
+    rf'(\\"({_SECRET_KEY_REGEX})\\"{_WS}:{_WS})\\"((?:[^"\\]|\\.)*)\\"', re.IGNORECASE
+)
+_RE_ESC_YAML = re.compile(
+    rf'((?:\\n){_WS}(?:[0-9]{{1,7}}\|{_WS})?({_SECRET_KEY_REGEX}){_WS}:{_WS})([^\\\s"\']+)',
+    re.IGNORECASE,
+)
 
 PLACEHOLDER_PREFIXES = (
     "your-", "your_", "my-", "my_", "example-", "example_", "sample-", "sample_",
@@ -205,15 +235,30 @@ def _should_mask_value(key_name: str, value: str) -> bool:
     if _is_sensitive_key(key_name) and len(clean_val) >= 4 and clean_val.isascii():
         if clean_val.lower() in ("true", "false", "null", "none"):
             return False
+        # Numeric settings under a token-ish key are configuration, not credentials:
+        # `max_tokens: 32768`, `proactive_prune_min_reclaim_tokens: 4096`. Long digit-only
+        # runs that look like hex/hash tokens are still caught by _looks_like_secret above.
+        if clean_val.isdigit():
+            return False
         return True
     return False
+
+
+# Single source for the direct-signature patterns: compiled once here and shared with the
+# offline scanner (`scan_credentials.PATTERNS`), so the two layers cannot drift apart.
+COMPILED_PATTERNS: tuple = tuple((p, re.compile(p)) for p in patterns.PATTERNS)
+
+
+def compiled_direct_patterns() -> tuple:
+    """Return ``((pattern_source, compiled), ...)`` for direct-signature matching."""
+    return COMPILED_PATTERNS
 
 
 def _apply_direct_patterns(text: str) -> str:
     """Apply compiled regex patterns from patterns.PATTERNS."""
     result = text
-    for pattern in patterns.PATTERNS:
-        result = re.sub(pattern, "***", result)
+    for _, pattern in COMPILED_PATTERNS:
+        result = pattern.sub("***", result)
     return result
 
 
@@ -276,8 +321,8 @@ def _apply_natural_language(text: str) -> str:
                 return match.group(0).replace(candidate, "***", 1)
         return match.group(0)
 
-    for pattern in _NATURAL_LANGUAGE_PATTERNS:
-        text = re.sub(pattern, _repl, text)
+    for pattern in _NL_COMPILED:
+        text = pattern.sub(_repl, text)
     return text
 
 
@@ -299,20 +344,10 @@ def redact_tool_result(tool_name: str, result: str, **kwargs) -> str | None:
     result = _apply_direct_patterns(result)
 
     # 2. Redact KEY=value patterns (only genuine secrets)
-    result = re.sub(
-        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\\]+)",
-        _replace_kv_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_KV_TOOL.sub(_replace_kv_if_secret, result)
 
     # 3. Redact JSON credential fields (preserving keys, only genuine secrets)
-    result = re.sub(
-        rf'("({_SECRET_KEY_REGEX})"\s*:\s*)"([^"]+)"',
-        _replace_json_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_JSON.sub(_replace_json_if_secret, result)
 
 
     # 4. Redact YAML/colon key-value fields
@@ -324,26 +359,11 @@ def redact_tool_result(tool_name: str, result: str, **kwargs) -> str | None:
             return f"{prefix}***"
         return m.group(0)
 
-    result = re.sub(
-        rf'(?m)^([^\S\r\n]*(?:[0-9]{{1,7}}[|:][^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?\s*$',
-        _replace_yaml,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_YAML_EOL.sub(_replace_yaml, result)
 
     # 5. Escaped payloads: tool results are often json.dumps()-ed, so inner quotes arrive as \"
-    result = re.sub(
-        rf'(\\"({_SECRET_KEY_REGEX})\\"[^\S\r\n]*:[^\S\r\n]*)\\"((?:[^"\\]|\\.)*)\\"',
-        _replace_escaped_json_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
-    result = re.sub(
-        rf'((?:\\n)[^\S\r\n]*(?:[0-9]{{1,7}}\|[^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]*)([^\\\s"\']+)',
-        _replace_escaped_yaml_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_ESC_JSON.sub(_replace_escaped_json_if_secret, result)
+    result = _RE_ESC_YAML.sub(_replace_escaped_yaml_if_secret, result)
 
     # 6. Natural-language mentions ("api key is …", "APIキーは …")
     result = _apply_natural_language(result)
@@ -373,18 +393,8 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
     result = _apply_direct_patterns(result)
 
     # 2. Redact KEY=value and key: value pairs in code blocks or text (only genuine secrets)
-    result = re.sub(
-        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\\\"']+)",
-        _replace_kv_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
-    result = re.sub(
-        rf'("({_SECRET_KEY_REGEX})"\s*:\s*)"([^"]+)"',
-        _replace_json_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_KV_ANY.sub(_replace_kv_if_secret, result)
+    result = _RE_JSON.sub(_replace_json_if_secret, result)
 
     # Redact YAML/colon key-value fields in LLM output
     def _replace_yaml_llm(m):
@@ -395,12 +405,7 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
             return f"{prefix}***"
         return m.group(0)
 
-    result = re.sub(
-        rf'(?m)^([^\S\r\n]*(?:[0-9]{{1,7}}[|:][^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?\s*$',
-        _replace_yaml_llm,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_YAML_EOL.sub(_replace_yaml_llm, result)
 
     # 3. Natural language credential references (meta-discussion)
     def _nl_replacer(m):
@@ -411,8 +416,8 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
                 return m.group(0).replace(potential_secret, "***", 1)
         return m.group(0)
 
-    for pattern in _NATURAL_LANGUAGE_PATTERNS:
-        result = re.sub(pattern, _nl_replacer, result)
+    for pattern in _NL_COMPILED:
+        result = pattern.sub(_nl_replacer, result)
 
     if result != original:
         logger.debug("Redacted credential references from LLM output")
@@ -448,28 +453,13 @@ def redact_terminal_output(command: str | None, output: str, **kwargs) -> str | 
                 return f"{key}=***"
             return m.group(0)
 
-        result = re.sub(
-            r"([A-Z_0-9]*(?:password|token|api[_-]?key|secret|auth)[A-Z_0-9]*)\s*=\s*([^\s\n\"']+)",
-            _replace_env_secret,
-            result,
-            flags=re.IGNORECASE
-        )
+        result = _RE_ENV_KV.sub(_replace_env_secret, result)
 
     # 3. General: KEY=value pattern anywhere (only genuine secrets)
-    result = re.sub(
-        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\\\"']+)",
-        _replace_kv_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_KV_ANY.sub(_replace_kv_if_secret, result)
 
     # 4. JSON-shaped secrets: {"client_secret": "..."} (core's terminal pass skips these)
-    result = re.sub(
-        rf'("({_SECRET_KEY_REGEX})"\s*:\s*)"([^"]+)"',
-        _replace_json_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_JSON.sub(_replace_json_if_secret, result)
 
     # 5. YAML / colon-shaped secrets: "  password: ..."
     def _replace_yaml_term(m):
@@ -480,26 +470,11 @@ def redact_terminal_output(command: str | None, output: str, **kwargs) -> str | 
             return f"{prefix}***"
         return m.group(0)
 
-    result = re.sub(
-        rf'(?m)^([^\S\r\n]*(?:[0-9]{{1,7}}[|:][^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?[^\S\r\n]*$',
-        _replace_yaml_term,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_YAML_LINE.sub(_replace_yaml_term, result)
 
     # 6. Escaped payloads (a log line carrying json.dumps() output)
-    result = re.sub(
-        rf'(\\"({_SECRET_KEY_REGEX})\\"[^\S\r\n]*:[^\S\r\n]*)\\"((?:[^"\\]|\\.)*)\\"',
-        _replace_escaped_json_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
-    result = re.sub(
-        rf'((?:\\n)[^\S\r\n]*(?:[0-9]{{1,7}}\|[^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]*)([^\\\s"\']+)',
-        _replace_escaped_yaml_if_secret,
-        result,
-        flags=re.IGNORECASE
-    )
+    result = _RE_ESC_JSON.sub(_replace_escaped_json_if_secret, result)
+    result = _RE_ESC_YAML.sub(_replace_escaped_yaml_if_secret, result)
 
     # 7. Natural-language mentions ("api key is …", "パスワードは … です")
     result = _apply_natural_language(result)
