@@ -837,5 +837,79 @@ profiles:
                 self.assertNotIn(secret_yaml[:10], err)
 
 
+class TestCoverageGaps(unittest.TestCase):
+    """Regressions for the shapes Hermes core does not catch on its own.
+
+    Core's ``redact_sensitive_text`` covers vendor-prefixed tokens and plain
+    ``KEY=value`` assignments, but not: escaped (json.dumps) payloads, YAML/JSON
+    values on the terminal surface, or natural-language mentions.
+    """
+
+    ESCAPED_JSON = 's3cr3tValue99XYZ'
+    LOW_ENTROPY_PW = 'hunter2abc'
+    BARE_TOKEN = 'Zx9Qw8Er7Ty6Ui5Op4'
+
+    def test_escaped_json_inside_tool_result(self):
+        import json as _json
+        result = _json.dumps({
+            "content": '1|OPENAI_API_KEY=x\n2|{"client_secret": "%s"}' % self.ESCAPED_JSON
+        })
+        redacted = hooks.redact_tool_result("read_file", result)
+        self.assertIsNotNone(redacted)
+        self.assertNotIn(self.ESCAPED_JSON, redacted)
+        self.assertIn('\\"***\\"', redacted)
+
+    def test_escaped_yaml_with_line_number_prefix(self):
+        import json as _json
+        result = _json.dumps({
+            "content": "1|service:\n2|  password: %s\n3|  mode: production" % self.LOW_ENTROPY_PW
+        })
+        redacted = hooks.redact_tool_result("read_file", result)
+        self.assertIsNotNone(redacted)
+        self.assertNotIn(self.LOW_ENTROPY_PW, redacted)
+        self.assertIn("password: ***", redacted)
+        self.assertIn("production", redacted)  # non-sensitive value preserved
+
+    def test_natural_language_in_tool_result(self):
+        text = "api key is %s (rotated today)" % self.BARE_TOKEN
+        redacted = hooks.redact_tool_result("web_extract", text)
+        self.assertIsNotNone(redacted)
+        self.assertNotIn(self.BARE_TOKEN, redacted)
+        self.assertIn("***", redacted)
+
+    def test_natural_language_keeps_benign_words(self):
+        for text in ("the token is expired", "the api key is required", "auth: required"):
+            self.assertIsNone(
+                hooks.redact_tool_result("web_extract", text),
+                msg="benign prose was masked: %s" % text,
+            )
+
+    def test_terminal_json_and_yaml_shapes(self):
+        cases = [
+            ('{"client_secret": "%s"}' % self.ESCAPED_JSON, self.ESCAPED_JSON),
+            ("password: %s" % self.LOW_ENTROPY_PW, self.LOW_ENTROPY_PW),
+            ("12:password: %s" % self.LOW_ENTROPY_PW, self.LOW_ENTROPY_PW),
+        ]
+        for output, secret in cases:
+            redacted = hooks.redact_terminal_output("cat app.log", output)
+            self.assertIsNotNone(redacted, msg="not redacted: %s" % output)
+            self.assertNotIn(secret, redacted)
+            self.assertIn("***", redacted)
+
+    def test_terminal_natural_language_ja(self):
+        output = "パスワードは Passw0rd2024! です"
+        redacted = hooks.redact_terminal_output("cat app.log", output)
+        self.assertIsNotNone(redacted)
+        self.assertNotIn("Passw0rd2024!", redacted)
+        self.assertIn("***", redacted)
+
+    def test_escaped_payload_does_not_swallow_following_lines(self):
+        """The KEY=value pass must stop at a backslash escape, not eat the next line."""
+        import json as _json
+        result = _json.dumps({"content": "OPENAI_API_KEY=x\n2|user: bob"})
+        redacted = hooks.redact_tool_result("read_file", result) or result
+        self.assertIn("2|user: bob", redacted)
+
+
 if __name__ == "__main__":
     unittest.main()

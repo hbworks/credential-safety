@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # Patterns for natural language & contextual credential references
 _NATURAL_LANGUAGE_PATTERNS = [
     # English patterns
-    r"(?i)(?<![a-zA-Z0-9_])(password|token|api[_-]?key|secret|auth)(?![a-zA-Z0-9_])(?:\s+(?:is|was|used|changed|set|updated|generated|configured))*(?:\s*(?:is|was|to|for|as|into|:|:=|=|：))+\s*['\"]?([^\s'\"!.,;:]+)['\"]?(?:\s|\.|$|,|!|。|;)",
+    r"(?i)(?<![a-zA-Z0-9_])(password|token|api[\s_-]?key|secret|auth)(?![a-zA-Z0-9_])(?:\s+(?:is|was|used|changed|set|updated|generated|configured))*(?:\s*(?:is|was|to|for|as|into|:|:=|=|：))+\s*['\"]?([^\s'\"!.,;:\\|{}()\[\]<>]+)['\"]?(?:\s|\.|$|,|!|。|;)",
 
     # Japanese patterns (secret part must be ASCII)
     r"(パスワード|トークン|シークレット|APIキー|認証情報|認証キー)(?:\s*(?:は|を|に|へ|で|：|:|=|として))+\s*['\"]?([a-zA-Z0-9_\-.~!@#$%^&*+/=]{8,})['\"]?",
@@ -236,6 +236,51 @@ def _replace_json_if_secret(match: re.Match) -> str:
     return match.group(0)
 
 
+def _replace_escaped_json_if_secret(match: re.Match) -> str:
+    """Replace a JSON value that arrives escaped (``\\"key\\": \\"value\\"``).
+
+    Tool results from file_tools / code execution / subprocess wrappers are often
+    ``json.dumps()``-ed, so an inner ``{"client_secret": "..."}`` reaches this hook as
+    ``{\\"client_secret\\": \\"...\\"}`` and the unescaped JSON pass above never matches it.
+    """
+    prefix, key_name, raw = match.group(1), match.group(2), match.group(3)
+    value = raw.replace('\\"', '"').replace("\\\\", "\\")
+    if _should_mask_value(key_name, value):
+        return prefix + '\\"***\\"'
+    return match.group(0)
+
+
+def _replace_escaped_yaml_if_secret(match: re.Match) -> str:
+    """Replace a YAML/colon value that arrives inside an escaped (``\\n``-joined) payload."""
+    prefix, key_name, value = match.group(1), match.group(2), match.group(3)
+    if _should_mask_value(key_name, value):
+        return prefix + "***"
+    return match.group(0)
+
+
+def _nl_candidate_is_secret(value: str) -> bool:
+    """Gate for natural-language matches: a bare word ('expired', 'amazing') is not a secret."""
+    if not value:
+        return False
+    if _looks_like_secret(value):
+        return True
+    return len(value) >= 6 and any(ch.isdigit() for ch in value)
+
+
+def _apply_natural_language(text: str) -> str:
+    """Redact 'the API key is X' / 'APIキーは X です' mentions in tool results and logs."""
+    def _repl(match: re.Match) -> str:
+        if len(match.groups()) >= 2:
+            candidate = match.group(2)
+            if candidate != "***" and _nl_candidate_is_secret(candidate):
+                return match.group(0).replace(candidate, "***", 1)
+        return match.group(0)
+
+    for pattern in _NATURAL_LANGUAGE_PATTERNS:
+        text = re.sub(pattern, _repl, text)
+    return text
+
+
 def redact_tool_result(tool_name: str, result: str, **kwargs) -> str | None:
     """Transform hook: redact credentials from tool results.
 
@@ -255,7 +300,7 @@ def redact_tool_result(tool_name: str, result: str, **kwargs) -> str | None:
 
     # 2. Redact KEY=value patterns (only genuine secrets)
     result = re.sub(
-        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n]+)",
+        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\\]+)",
         _replace_kv_if_secret,
         result,
         flags=re.IGNORECASE
@@ -280,11 +325,28 @@ def redact_tool_result(tool_name: str, result: str, **kwargs) -> str | None:
         return m.group(0)
 
     result = re.sub(
-        rf'(?m)^([^\S\r\n]*({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?\s*$',
+        rf'(?m)^([^\S\r\n]*(?:[0-9]{{1,7}}[|:][^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?\s*$',
         _replace_yaml,
         result,
         flags=re.IGNORECASE
     )
+
+    # 5. Escaped payloads: tool results are often json.dumps()-ed, so inner quotes arrive as \"
+    result = re.sub(
+        rf'(\\"({_SECRET_KEY_REGEX})\\"[^\S\r\n]*:[^\S\r\n]*)\\"((?:[^"\\]|\\.)*)\\"',
+        _replace_escaped_json_if_secret,
+        result,
+        flags=re.IGNORECASE
+    )
+    result = re.sub(
+        rf'((?:\\n)[^\S\r\n]*(?:[0-9]{{1,7}}\|[^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]*)([^\\\s"\']+)',
+        _replace_escaped_yaml_if_secret,
+        result,
+        flags=re.IGNORECASE
+    )
+
+    # 6. Natural-language mentions ("api key is …", "APIキーは …")
+    result = _apply_natural_language(result)
 
     if result != original:
         logger.debug(f"Redacted credential from tool {tool_name}")
@@ -312,7 +374,7 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
 
     # 2. Redact KEY=value and key: value pairs in code blocks or text (only genuine secrets)
     result = re.sub(
-        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\"']+)",
+        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\\\"']+)",
         _replace_kv_if_secret,
         result,
         flags=re.IGNORECASE
@@ -334,7 +396,7 @@ def redact_llm_output(response_text: str, **kwargs) -> str | None:
         return m.group(0)
 
     result = re.sub(
-        rf'(?m)^([^\S\r\n]*({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?\s*$',
+        rf'(?m)^([^\S\r\n]*(?:[0-9]{{1,7}}[|:][^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?\s*$',
         _replace_yaml_llm,
         result,
         flags=re.IGNORECASE
@@ -395,11 +457,52 @@ def redact_terminal_output(command: str | None, output: str, **kwargs) -> str | 
 
     # 3. General: KEY=value pattern anywhere (only genuine secrets)
     result = re.sub(
-        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\"']+)",
+        rf"({_SECRET_KEY_REGEX})\s*=\s*([^\s\n\\\"']+)",
         _replace_kv_if_secret,
         result,
         flags=re.IGNORECASE
     )
+
+    # 4. JSON-shaped secrets: {"client_secret": "..."} (core's terminal pass skips these)
+    result = re.sub(
+        rf'("({_SECRET_KEY_REGEX})"\s*:\s*)"([^"]+)"',
+        _replace_json_if_secret,
+        result,
+        flags=re.IGNORECASE
+    )
+
+    # 5. YAML / colon-shaped secrets: "  password: ..."
+    def _replace_yaml_term(m):
+        prefix = m.group(1)
+        key_name = m.group(2)
+        val = m.group(3)
+        if _should_mask_value(key_name, val):
+            return f"{prefix}***"
+        return m.group(0)
+
+    result = re.sub(
+        rf'(?m)^([^\S\r\n]*(?:[0-9]{{1,7}}[|:][^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]+)["\']?([^"\'\r\n]+?)["\']?[^\S\r\n]*$',
+        _replace_yaml_term,
+        result,
+        flags=re.IGNORECASE
+    )
+
+    # 6. Escaped payloads (a log line carrying json.dumps() output)
+    result = re.sub(
+        rf'(\\"({_SECRET_KEY_REGEX})\\"[^\S\r\n]*:[^\S\r\n]*)\\"((?:[^"\\]|\\.)*)\\"',
+        _replace_escaped_json_if_secret,
+        result,
+        flags=re.IGNORECASE
+    )
+    result = re.sub(
+        rf'((?:\\n)[^\S\r\n]*(?:[0-9]{{1,7}}\|[^\S\r\n]*)?({_SECRET_KEY_REGEX})[^\S\r\n]*:[^\S\r\n]*)([^\\\s"\']+)',
+        _replace_escaped_yaml_if_secret,
+        result,
+        flags=re.IGNORECASE
+    )
+
+    # 7. Natural-language mentions ("api key is …", "パスワードは … です")
+    result = _apply_natural_language(result)
 
     if result != original:
         return result

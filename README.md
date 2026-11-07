@@ -55,12 +55,12 @@ Directly addresses and patches the vulnerability reported in [GitHub Issue #2078
 
 #### 1. Tool Result Sanitization (`transform_tool_result`)
 * **Trigger**: Immediately after tool execution (file read, HTTP request, DB query).
-* **Behavior**: Replaces `KEY=VALUE` credentials with `***`, and sanitizes JSON fields (`api_key`, `secret`, `token`, etc.) while **preserving dictionary key names** (e.g., `"api_key": "***"`).
+* **Behavior**: Replaces `KEY=VALUE` credentials with `***`, and sanitizes JSON fields (`api_key`, `secret`, `token`, etc.) while **preserving dictionary key names** (e.g., `"api_key": "***"`). Also handles **escaped payloads** — tool results that are `json.dumps()`-ed (`\"client_secret\": \"…\"`, `\n  password: …`, including `12|` line-number prefixes) — plus natural-language mentions (`api key is …` / `APIキーは …`) gated by entropy so bare words like "expired" survive.
 * **Objective**: Prevents secrets from ever entering the LLM context memory.
 
 #### 2. Terminal Output Sanitization (`transform_terminal_output`)
 * **Trigger**: Upon capturing stdout/stderr from bash/shell tool executions.
-* **Behavior**: Sanitizes environment-variable dumps and output from commands that display credential files.
+* **Behavior**: Sanitizes environment-variable dumps, output from commands that display credential files, **JSON-shaped secrets** (`{"client_secret": "…"}`), **YAML/colon-shaped secrets** (`password: …`, `12:password: …` from `grep -n`), escaped log payloads, and natural-language mentions (`パスワードは … です`).
 
 #### 3. LLM Output & Reasoning Sanitization (`transform_llm_output`)
 * **Trigger**: After text generation, immediately prior to streaming or returning responses to the user.
@@ -242,12 +242,15 @@ Hermes Agent における認証情報（APIキー、トークン、パスワー�
   * `KEY=VALUE` 形式の設定値からシークレット値を `***` に置換。
   * JSON レスポンスに含まれるクレデンシャルフィールド（`api_key`, `secret`, `access_token` 等）の **キー名を維持したまま値のみをマスク**（例: `"api_key": "***"`）。
   * 既知のシークレットシグネチャを直接置換。
+  * **エスケープ済みペイロード**（`json.dumps()` された結果に含まれる `\"client_secret\": \"…\"` や `\n  password: …`、`12|` の行番号プレフィックス付き）も対象。
+  * 散文での言及（`api key is …` / `APIキーは …`）をエントロピー判定付きでマスク。「expired」のような普通の語は残します。
 * **目的**: そもそも LLM のコンテキスト（推論メモリ）に平文シークレットが流入することを入口で遮断します。
 
 #### 2. ターミナル出力のサニタイズ (`transform_terminal_output`)
 * **動作タイミング**: シェルコマンド実行の標準出力・標準エラー出力取得時。
 * **動作内容**:
   * 環境変数ダンプや機密設定ファイルを表示するコマンドの出力を検出・サニタイズ。
+  * **JSON形式**（`{"client_secret": "…"}`）、**YAML/コロン形式**（`password: …`、`grep -n` の `12:password: …`）、エスケープ済みログ行、散文（`パスワードは … です`）もマスク。
 
 #### 3. LLM出力・思考プロセスのサニタイズ (`transform_llm_output`)
 * **動作タイミング**: モデルがテキスト（最終回答および `<think>` 思考ブロック）を生成し、ユーザーへ配信する直前。
@@ -442,3 +445,27 @@ python3 ~/.hermes/plugins/credential-safety/scan_credentials.py
 ----------------------------------------------------------------------
 Summary: Checked 278 file(s) across 444,090 record/line entries.
 ```
+
+## 📝 Changelog
+
+### v1.0.1
+Hermes core now ships `agent/redact.py` (ON by default) covering vendor-prefixed
+tokens, plain `KEY=value` assignments, file reads, terminal output, assistant
+content and memory egress. This release closes the shapes core still misses:
+
+* **Escaped payloads** — tool results that are `json.dumps()`-ed, where inner keys
+  arrive as `\"client_secret\"` / `\n  password:`, now match (including `12|`
+  line-number prefixes from `read_file`).
+* **Terminal surface** — JSON (`{"client_secret": "…"}`) and YAML/colon
+  (`password: …`, `grep -n`'s `12:password: …`) shapes are masked; core's
+  terminal pass deliberately skips these.
+* **Natural language in tool results and logs** — `api key is …` /
+  `パスワードは … です` are masked without the LLM-output hook, gated so benign
+  prose (`the token is expired`) is left alone. The English pattern now accepts
+  `api key` (with a space), not just `api_key` / `api-key`.
+* **No cross-line swallowing** — the `KEY=value` pass stops at a backslash
+  escape, so an escaped payload can no longer eat the following lines.
+
+### v1.0.0
+Initial release: four-layer pipeline (tool result / terminal / LLM output /
+core pattern registration), plus the offline `scan_credentials.py` auditor.
