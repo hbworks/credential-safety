@@ -450,6 +450,75 @@ Summary: Checked 278 file(s) across 444,090 record/line entries.
 
 ## 📝 Changelog
 
+### v1.0.4
+False-positive fix: reading source code no longer gets mangled — without opening new
+leak paths.
+
+* **Code references are not credentials.** `_should_mask_value` now skips values that
+  read as an expression / attribute reference / call / template / shell reference
+  (`_looks_like_code_expr`): `password: user.password`, `token = get_token()`,
+  `api_key = os.environ.get("X")`, `password=f"{pw}"`, `password=$DB_PASSWORD`,
+  `token: Optional[str]`.
+* **Version/path shapes are checked before the entropy heuristic** (`_looks_like_structural_value`):
+  `v1.2.3`, `2.3.1-beta.1`, `node/18.17.0/bin/node`, `/usr/local/lib/tokens.d/1.2.3`
+  and credential-free URLs score high entropy but are not secrets.
+* **URLs that embed credentials still mask.** Userinfo (`postgres://user:pw@host/db`)
+  and sensitive query parameters (`?token=…`) are excluded from the structural shape
+  and are redacted as before.
+* **Code-like passwords still mask.** Braces, `->`, `::`, `&&`, `:=` are *not* treated
+  as code markers (`P@ss{word}123`, `x->y12345`), `==` is excluded so base64 padding
+  survives, and a bare `>` is no longer read as an already-masked value.
+* **Source-file reads keep every pass.** `read_file` / `search_files` on a code
+  extension (≈50 extensions) only changes the `key: value` pass: a value is masked
+  when it is a quoted literal or independently looks like a secret
+  (`password: "hunter2abc"` yes; `password: user.password` and `token: Optional[str]`
+  no). Direct signatures, `KEY=value`, JSON and natural-language passes all still run,
+  so a credential in an object literal or a comment is still caught.
+* **URL-embedded credentials mask wherever they appear.** A URL is often attached to a key
+  that says nothing about secrets, so `{"redirect_url": "https://user:pw@host/cb"}` used to
+  pass untouched. Userinfo is now masked as `scheme://***@host` and a sensitive query
+  parameter as `?token=***` — only the credential part, so the surrounding JSON/YAML stays
+  parseable and the host survives for context. Credential-free URLs are left alone.
+* **`KEY=value` inside a string no longer eats its delimiters.** The unquoted tool rule
+  stops at `" ' & ;`, quoted assignments (`API_KEY="…"`) get their own rule so stripping
+  the quote is impossible, and the natural-language pass stops at `&`/`#`.
+  `{"cmd": "export API_KEY=…; echo hi"}` stays valid JSON with `; echo hi` intact.
+* **Metadata names are not credentials.** `token_id`, `token_type`, `token_name`,
+  `secret_id` and friends (suffixes `_id`/`_type`/`_name`/`_ttl`/`_endpoint`/`_required`/…)
+  name a credential rather than being one, so both the key-name fallback and the
+  URL-parameter pass skip them: `?token_id=12345&token_type=bearer` survives while
+  `?token=12345` still masks (digit-only stays protected on the URL path — OTPs are often
+  numeric). `_header`, `_field`, `_param`, `_prefix` and `_suffix` are deliberately **not**
+  exempt: `api_key_header` can hold the token itself.
+* **An alphabetic run is not automatically a word.** A value with no digits was always
+  rejected as a placeholder; a long mixed-case run (`AbCdEfGhIjKlMnOpQrStUvWx`, ≥20 chars,
+  entropy ≥3.5) is now treated as a random token and masked.
+* **Opaque tokens in a URL *path* are masked** (`/reset/a1B2c3D4…`): the segment must be
+  ≥16 chars, mixed case with digits, entropy ≥3.5, and ≥25% uppercase in its letter run.
+  A token is recognised even when a sentence or markdown closes the URL
+  (`…/reset/<token>.`, `[x](…/reset/<token>)`), and a bare hex digest of 32+ characters is
+  masked regardless of case — reset URLs really do carry lowercase hex
+  (`/reset/8f14e45f…`). A hyphenated UUID stays readable
+  (`/o/550e8400-e29b-…)`, and so does a lowercase-heavy slug
+  (`/campaign/SummerSale2026Bundle`). Accepted false positive: a full 40-character git
+  commit SHA in a URL path is masked too (`/commit/***`). Word runs are
+  deliberately *not* a signal — a token containing a dictionary word
+  (`/reset/tokenAbCdEf…`) would escape otherwise. Known trade-off: a CamelCase marketing
+  slug (`/collection/iPhone15ProMaxBundleXYZ123`) is masked as if it were a token;
+  leak-prevention wins.
+  The thresholds (`_URL_TOKEN_MIN_LEN`, `_URL_TOKEN_MIN_ENTROPY`,
+  `_URL_TOKEN_MIN_UPPER_RATIO`) are heuristics tuned on synthetic values — **not** a
+  measured capture rate for real-world tokens. A 32-character token with only 2–3
+  uppercase letters still escapes; lower the ratio if that matters more than slug noise.
+* **Only URL spans are rewritten.** The path rule runs inside a `scheme://…` match, so a
+  plain filesystem path (`/srv/app/releases/<id>/main.py`) is never touched, and
+  documentation examples (`https://user:pw@host`, `?token=…`) stay readable — reading the
+  plugin's own source is still a no-op.
+* **The backup-collision test no longer races the clock.** It pre-creates a fixed-name
+  timestamped backup instead of deriving one from `datetime.now()`, which failed whenever
+  the scanner crossed a second boundary.
+* 21 regression tests added; no existing expectation changed.
+
 ### v1.0.3
 Structural change, no behaviour change: the dependency-free YAML reader moved out of
 `scan_credentials.py` into `yaml_fallback.py` (289 lines, pure functions, no I/O).

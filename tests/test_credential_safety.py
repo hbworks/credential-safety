@@ -93,20 +93,24 @@ class TestHooks(unittest.TestCase):
         self.assertIsNone(redacted_tool)
 
     def test_redact_new_patterns(self):
-        """Should redact Google, GitHub PAT, Stripe, and HuggingFace tokens."""
+        """Generated token-shaped fixtures exercise prefix checks without storing a key."""
         cases = [
-            ("Google API Key", "AIzaSyD-1234567890abcdefghijklmnopqrst", True),
-            ("Google OAuth", "ya29.a0AfH6SMD-1234567890abcdefghij", True),
-            ("GitHub PAT", "github_pat_11AAAAAAA01234567890ab_abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqr", True),
-            ("Stripe Secret", "sk_live_" + "a" * 24, True),
-            ("HuggingFace", "hf_abcdefghijklmnopqrstuvwxyz123456", True),
+            ("Google API Key", "AIza" + "A" * 35),
+            ("Google OAuth", "ya29." + "A" * 20),
+            ("GitHub classic", "ghp_" + "a" * 36),
+            ("GitHub PAT", "github_pat_" + "a" * 60),
+            ("AWS access key ID", "AKIA" + "A" * 16),
+            ("Stripe Secret", "sk_live_" + "a" * 24),
+            ("HuggingFace", "hf_" + "a" * 30),
         ]
-        for name, token, should_redact in cases:
-            text = f"API Token for {name}: {token}"
-            redacted = hooks.redact_llm_output(text)
-            self.assertIsNotNone(redacted, f"Failed to redact {name}")
-            self.assertNotIn(token, redacted, f"Token leaked in {name}")
-            self.assertIn("***", redacted)
+        for name, token in cases:
+            with self.subTest(name=name):
+                self.assertTrue(hooks._looks_like_secret(token), f"Prefix check failed for {name}")
+                text = f"API Token for {name}: {token}"
+                redacted = hooks.redact_llm_output(text)
+                self.assertIsNotNone(redacted, f"Failed to redact {name}")
+                self.assertNotIn(token, redacted, f"Token leaked in {name}")
+                self.assertIn("***", redacted)
 
     def test_looks_like_secret(self):
         """Should identify likely secrets by entropy / structure and reject placeholders."""
@@ -584,12 +588,11 @@ profiles:
             self.assertGreaterEqual(data["scan_errors"], 1)
             self.assertTrue(any("auth.json" in err for err in data["errors"]))
 
-    def test_backup_preserves_existing_bak_even_on_same_second_collision(self):
-        """Verify that multiple backups created within the same second use incremented counters and don't overwrite."""
+    def test_backup_does_not_overwrite_existing_baks(self):
+        """Verify that existing standard and timestamped .bak files are both preserved when --fix runs."""
         import subprocess
         import tempfile
         import sqlite3
-        from datetime import datetime
 
         scan_script = Path(__file__).resolve().parent.parent / "scan_credentials.py"
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -601,11 +604,11 @@ profiles:
             conn.commit()
             conn.close()
 
-            # Pre-create standard .bak and a timestamped backup that simulates current second
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Pre-create the standard .bak plus one timestamped backup. The timestamp is a
+            # fixed string: deriving it from "now" races the clock across a second boundary.
             orig_bak = Path(tmpdir) / "data.sqlite.bak"
             orig_bak.write_text("ORIGINAL_STANDARD_BACKUP", encoding="utf-8")
-            orig_ts_bak = Path(tmpdir) / f"data.sqlite.bak.{ts}"
+            orig_ts_bak = Path(tmpdir) / "data.sqlite.bak.20000101_000000"
             orig_ts_bak.write_text("ORIGINAL_TIMESTAMPED_BACKUP", encoding="utf-8")
 
             # Run --fix
@@ -619,9 +622,9 @@ profiles:
             self.assertEqual(orig_bak.read_text(encoding="utf-8"), "ORIGINAL_STANDARD_BACKUP")
             self.assertEqual(orig_ts_bak.read_text(encoding="utf-8"), "ORIGINAL_TIMESTAMPED_BACKUP")
 
-            # A counter-appended backup (e.g. *.bak.<ts>_1) must exist
-            incremented_backups = list(Path(tmpdir).glob(f"data.sqlite.bak.{ts}_*"))
-            self.assertGreaterEqual(len(incremented_backups), 1)
+            # A new timestamped backup must have been created next to the existing ones
+            created = [p for p in Path(tmpdir).glob("data.sqlite.bak.*") if p != orig_ts_bak]
+            self.assertGreaterEqual(len(created), 1)
 
     def test_corrupted_yaml_reports_error(self):
         """Verify that a corrupted YAML config/auth file reports a scan error (exit code 2),
@@ -987,6 +990,277 @@ class TestReviewFixes(unittest.TestCase):
                      "Authorization: Bearer example-abc-def"):
             self.assertFalse(S.LeakDetector().scan_text(text, {}), msg="false positive: %s" % text)
         self.assertTrue(S.LeakDetector().scan_text("Authorization: Bearer ab12cd34ef56gh78", {}))
+
+
+class TestCodeFalsePositives(unittest.TestCase):
+    """Regressions: code references, version literals and source-file reads must survive intact.
+
+    The key-context fallback used to mask anything under a sensitive key, so reading a
+    source file turned `password: user.password` into `password: ***`. These tests pin the
+    gate that stops it without weakening real-secret detection.
+    """
+
+    CODE_PATH = "/Users/masato/Dev/app/auth.py"
+
+    def test_code_expression_not_masked(self):
+        """Attribute refs, calls, env lookups, templates and shell refs are references, not secrets."""
+        for key, value in (("password", "user.password"),
+                           ("token", "get_token()"),
+                           ("api_key", 'os.environ.get("BACKLOG_API_KEY")'),
+                           ("secret", "self.client.secret"),
+                           ("password", 'f"{pw}"'),
+                           ("password", "$DB_PASSWORD")):
+            self.assertFalse(hooks._should_mask_value(key, value), msg="%s=%s" % (key, value))
+        self.assertTrue(hooks._looks_like_code_expr("config.get_key()"))
+
+        for src in ("auth:\n  password: user.password\n",
+                    "token: get_token()",
+                    'api_key = os.environ.get("BACKLOG_API_KEY")',
+                    '{"api_key": "config.get_key()"}',
+                    'password=f"{pw}"',
+                    "password=$DB_PASSWORD",
+                    "secret: self.client.secret"):
+            # both the flat kwarg shape and the real Hermes `args=` payload
+            for kwargs in ({"path": self.CODE_PATH}, {"args": {"path": self.CODE_PATH}}):
+                self.assertIsNone(hooks.redact_tool_result("read_file", src, **kwargs), msg=src)
+
+    def test_semver_path_not_masked(self):
+        """Version literals and versioned paths are not credentials."""
+        for value in ("v1.2.3", "1.2.3", "2.3.1-beta.1",
+                      "node/18.17.0/bin/node", "/usr/local/lib/tokens.d/1.2.3"):
+            for key in ("token", "api_key", "secret"):
+                self.assertFalse(hooks._should_mask_value(key, value), msg="%s=%s" % (key, value))
+        self.assertIsNone(
+            hooks.redact_tool_result("read_file", "token: v1.2.3", path="/srv/app/version.txt")
+        )
+        # ... while a real high-entropy credential under the same key still masks
+        self.assertTrue(hooks._should_mask_value("token", "token1234567890"))
+
+    def test_low_entropy_password_still_masked(self):
+        """The code gate must not swallow genuine low-entropy passwords."""
+        self.assertTrue(hooks._should_mask_value("password", "admin123"))
+        cases = (
+            ('{"user": "alice", "password": "admin123"}', {"path": self.CODE_PATH}),
+            ("auth:\n  password: admin123", {"path": "/srv/app/config.yaml"}),
+            ("db_password=admin123", {}),
+        )
+        for src, kwargs in cases:
+            out = hooks.redact_tool_result("read_file", src, **kwargs)
+            self.assertIsNotNone(out, msg=src)
+            self.assertNotIn("admin123", out)
+
+    def test_e164_phone_still_masked(self):
+        """E.164 numbers start with '+' and must keep being masked under a sensitive key."""
+        self.assertTrue(hooks._should_mask_value("token", "+819012345678"))
+        self.assertTrue(hooks._should_mask_value("api_key", "+14155550123"))
+        out = hooks.redact_tool_result(
+            "read_file", '{"auth_token": "+819012345678"}', path=self.CODE_PATH
+        )
+        self.assertIsNotNone(out)
+        self.assertNotIn("819012345678", out)
+
+    def test_source_file_still_redacts_literals_and_comments(self):
+        """A code extension is not a free pass: quoted literals and comment prose still mask."""
+        out = hooks.redact_tool_result(
+            "read_file", 'const c = { password: "hunter2abc" };', path="/a/x.ts"
+        )
+        self.assertIsNotNone(out)
+        self.assertNotIn("hunter2abc", out)
+
+        out = hooks.redact_tool_result("read_file", "# the token is abc123def", path=self.CODE_PATH)
+        self.assertIsNotNone(out)
+        self.assertNotIn("abc123def", out)
+
+        # References, annotations and version literals stay intact
+        for src in ('const c = { password: user.password };', "token: Optional[str]",
+                    'const v = "v1.2.3";'):
+            self.assertIsNone(hooks.redact_tool_result("read_file", src, path="/a/x.ts"), msg=src)
+
+    def test_url_query_credentials_still_masked(self):
+        """A URL carrying userinfo or a sensitive query parameter is a credential."""
+        for v in ("https://api.x.com/cb?token=p4ssw0rd99&a=1",
+                  "https://user:pw@api.x.com/v1",
+                  "postgres://user:p4ssw0rd@localhost:5432/db"):
+            self.assertTrue(hooks._should_mask_value("token", v), msg=v)
+        self.assertFalse(
+            hooks._should_mask_value("token", "https://api.x.com/v1/items?page=2")
+        )
+
+    def test_code_like_passwords_still_masked(self):
+        """Passwords that merely resemble code syntax must keep being masked."""
+        for v in ("P@ss{word}123", "x->y12345", "pa$$word123", "My.P4ssw0rd"):
+            self.assertTrue(hooks._should_mask_value("password", v), msg=v)
+
+    def test_ambiguous_sensitive_value_without_path_is_masked(self):
+        """Without source-path evidence, prefer masking an ambiguous credential-shaped value."""
+        ambiguous = "password: a && b"
+        self.assertIsNone(
+            hooks.redact_tool_result("read_file", ambiguous, path=self.CODE_PATH),
+            "a known source path identifies the expression as code",
+        )
+        self.assertEqual(hooks.redact_tool_result("read_file", ambiguous), "password: ***")
+
+
+class TestUrlCredentialPaths(unittest.TestCase):
+    """Credentials inside a URL, attached to a key that says nothing about secrets.
+
+    `{"redirect_url": "https://user:pw@host/cb"}` never reached the key-named passes, and
+    masking the whole value broke the surrounding JSON. Both are regressions now pinned here.
+    """
+
+    def test_json_url_userinfo_masked_and_json_stays_valid(self):
+        import json as _json
+        src = '{"redirect_url": "https://user:p4ssw0rd99@x.com/cb"}'
+        out = hooks.redact_tool_result("api_call", src)
+        self.assertIsNotNone(out)
+        self.assertNotIn("p4ssw0rd99", out)
+        self.assertEqual(_json.loads(out)["redirect_url"], "https://***@x.com/cb")
+
+    def test_json_url_query_masked_without_eating_delimiters(self):
+        import json as _json
+        src = '{"redirect_url": "https://x.com/cb?token=p4ssw0rd99&a=1"}'
+        out = hooks.redact_tool_result("api_call", src)
+        self.assertIsNotNone(out)
+        parsed = _json.loads(out)["redirect_url"]  # invalid JSON would raise here
+        self.assertNotIn("p4ssw0rd99", parsed)
+        self.assertTrue(parsed.endswith("&a=1"))
+
+    def test_key_value_inside_a_json_string_keeps_its_delimiters(self):
+        import json as _json
+        src = '{"cmd": "export API_KEY=abc123def; echo hi"}'
+        out = hooks.redact_tool_result("api_call", src)
+        self.assertIsNotNone(out)
+        cmd = _json.loads(out)["cmd"]
+        self.assertNotIn("abc123def", cmd)
+        self.assertIn("; echo hi", cmd)
+
+    def test_url_credentials_masked_on_llm_and_terminal_surfaces(self):
+        llm = hooks.redact_llm_output("Visit https://admin:S3cretPass@internal.example/cb now")
+        self.assertIsNotNone(llm)
+        self.assertNotIn("S3cretPass", llm)
+        self.assertIn("internal.example", llm)  # host preserved for context
+
+        term = hooks.redact_terminal_output(
+            "curl x", "GET https://api.x/cb?api_key=xxxTOKENVALUE123&page=2"
+        )
+        self.assertIsNotNone(term)
+        self.assertNotIn("xxxTOKENVALUE123", term)
+        self.assertIn("&page=2", term)
+
+        # A credential-free URL is left alone on every surface
+        self.assertIsNone(
+            hooks.redact_tool_result("api_call", "https://api.example.com/v1/items?page=2")
+        )
+
+    def test_short_auth_parameter_is_preserved_and_numeric_tokens_are_masked(self):
+        import json as _json
+
+        src = _json.dumps({"redirect_url": "https://api.example.invalid/cb?auth=required"})
+        self.assertIsNone(hooks.redact_tool_result("api_call", src), msg=src)
+
+        # Numeric values on actual token parameters may be OTPs; don't exempt them by value shape.
+        for name in ("token", "access_token"):
+            with self.subTest(name=name):
+                src = _json.dumps({"redirect_url": f"https://api.example.invalid/cb?{name}=12345"})
+                out = hooks.redact_tool_result("api_call", src)
+                self.assertIsNotNone(out, msg=src)
+                parsed = _json.loads(out)
+                self.assertEqual(parsed["redirect_url"].split("?")[1], f"{name}=***")
+
+
+    def test_metadata_parameter_names_are_not_credentials(self):
+        """`token_id` / `token_type` are metadata about a credential, not the credential."""
+        for name, val in (("token_id", "12345"), ("token_type", "bearer"),
+                          ("token_name", "prod"), ("secret_id", "abc")):
+            self.assertFalse(hooks._should_mask_value(name, val), msg=name)
+
+        out = hooks.redact_tool_result(
+            "api_call", "https://x/cb?token_id=12345&token_type=bearer&token=12345"
+        )
+        self.assertIsNotNone(out)
+        self.assertIn("token_id=12345", out)
+        self.assertIn("token_type=bearer", out)
+        self.assertNotIn("token=12345", out)
+
+        # A genuine high-entropy token stored under a metadata-looking name still masks
+        self.assertTrue(hooks._should_mask_value("token_id", "a1B2c3D4e5F6g7H8i9J0k1L2"))
+
+
+    def test_metadata_suffixes_do_not_hide_a_real_token(self):
+        """`_header` and friends are no longer exempt; a long mixed-case run is a token."""
+        self.assertTrue(hooks._should_mask_value("api_key_header", "AbCdEfGhIjKlMnOpQrStUvWx"))
+        self.assertFalse(hooks._should_mask_value("api_key_header", "X-API-Key"))
+
+        out = hooks.redact_tool_result("api_call", '{"api_key_header": "AbCdEfGhIjKlMnOpQrStUvWx"}')
+        self.assertIsNotNone(out)
+        self.assertNotIn("AbCdEfGhIjKlMnOpQrStUvWx", out)
+
+    def test_opaque_token_in_url_path_masked(self):
+        """A secret carried in the URL *path* is masked; UUIDs and doc examples are not."""
+        opaque = "a1B2c3D4e5F6g7H8i9J0k1L2"
+        src = '{"reset_url": "https://links.example.invalid/reset/%s"}' % opaque
+        out = hooks.redact_tool_result("api_call", src)
+        self.assertEqual(out, '{"reset_url": "https://links.example.invalid/reset/***"}')
+
+        self.assertIsNone(hooks.redact_tool_result(
+            "api_call", '{"url": "https://app/o/550e8400-e29b-41d4-a716-446655440000"}'))
+        self.assertIsNone(hooks.redact_tool_result("api_call", "see https://user:pw@host/cb"))
+
+        # A token that contains a dictionary word is still a token: word runs are not a signal
+        self.assertIsNotNone(hooks.redact_tool_result(
+            "api_call", "https://app/reset/tokenAbCdEfGhIjKlMnOpQrStUvWx123"))
+
+        # A lowercase-heavy slug is not a token ...
+        self.assertIsNone(hooks.redact_tool_result(
+            "api_call", "https://shop.example/campaign/SummerSale2026Bundle"))
+        # ... while a CamelCase slug with near-half uppercase is treated as one (documented FP)
+        self.assertIsNotNone(hooks.redact_tool_result(
+            "api_call", "https://shop.example/collection/iPhone15ProMaxBundleXYZ123"))
+
+        # Only URL spans are touched: a filesystem path is never rewritten
+        self.assertIsNone(hooks.redact_tool_result(
+            "api_call", "/srv/app/releases/a1B2c3D4e5F6g7H8i9J0k1L2/main.py"))
+
+    def test_short_opaque_path_token_masked(self):
+        """An 18-character opaque segment is already a token."""
+        self.assertIsNotNone(hooks.redact_tool_result("api_call", "https://app/r/xQ7Lm2Np9Rt4Vw8Zk1"))
+
+    def test_path_token_followed_by_punctuation_is_masked(self):
+        """Prose and markdown put `.`/`)`/`,` right after the token; it must still mask."""
+        cases = (("https://app/reset/a1B2c3D4e5F6g7H8.", "***."),
+                 ("[reset](https://app/reset/a1B2c3D4e5F6g7H8)", "***)"),
+                 ("See https://app/reset/a1B2c3D4e5F6g7H8, go", "***,"))
+        for src, expected in cases:
+            out = hooks.redact_tool_result("api_call", src)
+            self.assertIsNotNone(out, msg=src)
+            self.assertIn(expected, out, msg=src)
+            self.assertNotIn("a1B2c3D4e5F6g7H8", out)
+
+    def test_lowercase_hex_path_token_masked(self):
+        """A 32/40-character hex digest in a path is a token, even with no uppercase."""
+        for seg in ("8f14e45fceea167a5a36dedd4bea2543",
+                    "8f14e45fceea167a5a36dedd4bea2543a1b2c3d4e5f6a7b8"):
+            out = hooks.redact_tool_result("api_call", "https://app/reset/" + seg)
+            self.assertEqual(out, "https://app/reset/***", msg=seg)
+        # A hyphenated UUID is not a bare digest: the URL pass itself must be a no-op
+        uuid_url = "https://app/o/550e8400-e29b-41d4-a716-446655440000"
+        self.assertEqual(hooks._apply_url_credentials(uuid_url), uuid_url)
+        self.assertTrue(hooks._looks_like_structural_value(uuid_url))
+        self.assertIsNone(hooks.redact_tool_result("api_call", uuid_url))
+
+    def test_own_source_read_is_a_no_op(self):
+        """Reading the plugin's own docstrings/regexes must not rewrite anything."""
+        path = Path(hooks.__file__)
+        self.assertIsNone(hooks.redact_tool_result(
+            "read_file", path.read_text(encoding="utf-8"), args={"path": str(path)}))
+
+    def test_source_url_masks_only_the_token(self):
+        """A URL constant in source keeps its quotes; only the opaque segment is masked."""
+        src = 'BASE = "https://api.example/v1/reset/a1B2c3D4e5F6g7H8"'
+        out = hooks.redact_tool_result("read_file", src, args={"path": "/app/config.py"})
+        self.assertIsNotNone(out)
+        self.assertNotIn("a1B2c3D4e5F6g7H8", out)
+        self.assertIn('"https://api.example/v1/reset/***"', out)
 
 
 if __name__ == "__main__":

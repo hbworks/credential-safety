@@ -1,5 +1,5 @@
 name: credential-safety
-version: 1.0.3
+version: 1.0.4
 author: masato
 description: |
   Multi-layer credential leakage prevention plugin.
